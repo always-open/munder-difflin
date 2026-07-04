@@ -18,6 +18,20 @@ const GOD_ID = 'god';
 const SPAWN_ACCENTS = ['coral', 'mint', 'sky', 'lemon', 'lilac', 'peach'] as const;
 const GOD_PTY = `pty-${GOD_ID}`;
 
+/** Deterministic accent for a registry agent that carries no stored colour —
+ *  mirrors the MAIN-spawn mapping in effect #5b so the same id always looks the
+ *  same on the floor. */
+function accentForId(id: string): (typeof SPAWN_ACCENTS)[number] {
+  let h = 0;
+  for (const ch of id) h = (h + ch.charCodeAt(0)) % SPAWN_ACCENTS.length;
+  return SPAWN_ACCENTS[h];
+}
+/** Map a registry agent's name/id to an Office character (mirrors effect #5b). */
+function characterForName(name: string): Agent['character'] {
+  const key = (name || '').toLowerCase();
+  return OFFICE_CAST.find((m) => m.name === key || m.displayName.toLowerCase() === key)?.name ?? DEFAULT_CHARACTER;
+}
+
 // How long to let Claude Code's TUI finish booting before we type the first
 // thing into Michael's terminal, and how long to PAUSE after the /remote-control
 // command so the slash command lands + executes on its own line before the
@@ -846,5 +860,63 @@ export function useHive(config: HarnessConfig | null): void {
       if (!dead.length) return; // healthy wake — nothing wedged, no-op
       for (const id of dead) void revive(id);
     });
+  }, [config?.onboardingComplete]);
+
+  // 8) Adopt hand-authored / shell-spawned hive agents so they're restorable from
+  //    the UI. The renderer's roster is a localStorage mirror built ONLY by in-app
+  //    spawns, so an agent that exists in hive/registry.json but was created OUTSIDE
+  //    the UI — a hand-authored agents/<id>/ folder, or a sub-agent GOD spawned via
+  //    raw shell — is invisible on the floor, and the main process archives it at
+  //    boot (archiveOrphanedAgents) because it owns no managed PTY. Here we read the
+  //    on-disk registry and surface every such agent in the restorable list, so the
+  //    existing "restore team" button spawns a managed PTY under the SAME id — its
+  //    memory.md, inbox and registry entry reattach automatically, and ensureAgent
+  //    clears the registry `archived` flag on (re)spawn. Additive + idempotent via
+  //    adoptRestorable (it skips any live / archived / already-restorable id). We
+  //    re-check periodically so agents GOD spawns via shell mid-session appear too.
+  useEffect(() => {
+    if (!config?.onboardingComplete) return;
+    let cancelled = false;
+    const reconcile = async () => {
+      try {
+        const [reg, ptys] = await Promise.all([
+          window.cth.hiveRegistry(),
+          window.cth.listPtys().catch(() => [] as Array<{ id: string }>)
+        ]);
+        if (cancelled || !reg?.agents) return;
+        const livePty = new Set(ptys.map((p) => p.id));
+        const onFloor = new Set(useStore.getState().agents.map((a) => a.id));
+        const candidates: Agent[] = [];
+        for (const [id, meta] of Object.entries(reg.agents)) {
+          if (id === reg.godId || meta.isGod) continue;   // Michael auto-boots; never restorable
+          if (meta.isAssistant) continue;                 // send-only prep assistant; auto-boots
+          if (onFloor.has(id)) continue;                  // already live on the floor
+          if (livePty.has(id) || livePty.has(`pty-${id}`)) continue; // already owns a managed PTY
+          candidates.push({
+            id,
+            name: meta.name || id,
+            character: characterForName(meta.name || id),
+            accent: accentForId(id),
+            description: meta.role || 'restored from the hive registry',
+            project: (meta.cwd || '').split(/[\\/]/).filter(Boolean).pop() || 'hive',
+            tmuxTarget: '',
+            cwd: meta.cwd || '',
+            status: 'idle',
+            action: 'idle',
+            progress: 0,
+            provider: meta.provider,
+            archived: true,
+            recentTextTs: Date.now()
+          });
+        }
+        if (!cancelled && candidates.length) useStore.getState().adoptRestorable(candidates);
+      } catch { /* best-effort — the registry may be momentarily unavailable */ }
+    };
+    // Let Michael's boot + the live-PTY reconcile settle first (so we don't briefly
+    // list an agent about to reappear as a live PTY), then poll to pick up agents
+    // GOD spawns via shell mid-session.
+    const t = setTimeout(() => { void reconcile(); }, 2500);
+    const iv = setInterval(() => { void reconcile(); }, 15000);
+    return () => { cancelled = true; clearTimeout(t); clearInterval(iv); };
   }, [config?.onboardingComplete]);
 }

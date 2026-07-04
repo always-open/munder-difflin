@@ -164,6 +164,13 @@ interface State {
   removeArchivedAgent: (id: string) => void;
   /** Drop one agent from the restorable list (it was respawned or dismissed). */
   removeRestorableAgent: (id: string) => void;
+  /** Adopt agents that live in the on-disk hive registry but aren't known to the
+   *  renderer yet — hand-authored `agents/<id>/` folders, or sub-agents GOD spawned
+   *  via raw shell. They land in the restorable list so the user can one-click
+   *  respawn them under their SAME id (memory.md, inbox and registry entry reattach
+   *  automatically, and the spawn clears the registry `archived` flag). Additive +
+   *  idempotent: never touches a live, archived, or already-restorable id. */
+  adoptRestorable: (candidates: Agent[]) => void;
   /** One-shot request to open a Command-Center tab (e.g. clicking the office
    *  task board → 'tasks'). `seq` makes repeated identical requests distinct. */
   ccTabRequest: { tab: string; seq: number } | null;
@@ -491,6 +498,23 @@ export const useStore = create<State>((set) => ({
     set((s) => {
       if (!s.restorableAgents.some((a) => a.id === id)) return s;
       const restorableAgents = s.restorableAgents.filter((a) => a.id !== id);
+      persistRestorable(restorableAgents);
+      return { restorableAgents };
+    }),
+  adoptRestorable: (candidates) =>
+    set((s) => {
+      // An id that's already live on the floor, in the Archived view, or already
+      // queued as restorable must never be re-surfaced here — those are owned by
+      // the in-app lifecycle. Only agents the renderer has never seen (created
+      // OUTSIDE the UI) are adopted.
+      const known = new Set<string>([
+        ...s.agents.map((a) => a.id),
+        ...s.archivedAgents.map((a) => a.id),
+        ...s.restorableAgents.map((a) => a.id)
+      ]);
+      const fresh = candidates.filter((c) => c.id && !known.has(c.id));
+      if (!fresh.length) return s;
+      const restorableAgents = [...s.restorableAgents, ...fresh];
       persistRestorable(restorableAgents);
       return { restorableAgents };
     }),
