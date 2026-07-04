@@ -18,6 +18,10 @@ export interface HiveAgentMeta {
   name: string;
   /** Which CLI this agent runs on (claude/codex/antigravity/custom); defaults claude. */
   provider?: AgentProvider;
+  /** Persisted per-agent model id (e.g. 'claude-opus-4-8', 'claude-sonnet-5',
+   *  'claude-opus-4-8[1m]'). Drives the `--model` flag when the agent is (re)spawned;
+   *  unset = fall back to the global default model. */
+  model?: string;
   role?: string;
   capabilities?: string[];
   cwd: string;

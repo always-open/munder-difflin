@@ -127,6 +127,10 @@ export interface AgentMeta {
   name: string;
   /** Which CLI this agent runs on. Defaults to 'claude' when unset (legacy). */
   provider?: AgentProvider;
+  /** Persisted per-agent model id (e.g. 'claude-opus-4-8', 'claude-sonnet-5',
+   *  'claude-opus-4-8[1m]'). Preserved across respawns via the registry upsert's
+   *  `...prev` spread; drives `--model` at (re)spawn. Unset = global default. */
+  model?: string;
   role?: string;
   capabilities?: string[];
   cwd: string;

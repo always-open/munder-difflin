@@ -905,6 +905,9 @@ export function useHive(config: HarnessConfig | null): void {
             action: 'idle',
             progress: 0,
             provider: meta.provider,
+            // Per-agent model recorded in the registry (opus vs sonnet, [1m], …).
+            // restoreTeam feeds this into buildSpawnCommand → the --model flag.
+            model: meta.model,
             archived: true,
             recentTextTs: Date.now()
           });

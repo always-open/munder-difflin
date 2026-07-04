@@ -93,7 +93,10 @@ export function AgentStrip({ config }: AgentStripProps) {
           // agent id is preserved across restart, so its registry entry,
           // memory.md and inbox reattach by id. No-op without a recorded session.
           resume: true,
-          hive: { id: a.id, name: a.name, provider, cwd, role: a.description }
+          // Persist the per-agent model back into the registry (ensureAgent's
+          // upsert keeps it via ...prev), so it survives future respawns even
+          // though the --model flag itself rides in the command above.
+          hive: { id: a.id, name: a.name, provider, model: a.model, cwd, role: a.description }
         });
         if (res.ok) {
           useStore.getState().addAgent({
