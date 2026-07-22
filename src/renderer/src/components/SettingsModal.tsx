@@ -1,5 +1,9 @@
 import { useState, useEffect, type CSSProperties } from 'react';
-import type { HarnessConfig } from '@/store/config';
+import {
+  DEFAULT_TERMINAL_FONT_FAMILY,
+  DEFAULT_TERMINAL_FONT_SIZE,
+  type HarnessConfig
+} from '@/store/config';
 import { useStore } from '@/store/store';
 import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
@@ -138,6 +142,30 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     setNotifications(next); // optimistic
     try { await window.cth.setNotifications(next); }
     catch { setNotifications(!next); /* revert on failure */ }
+  };
+
+  // --- Terminal font (#95) — family + default size for every agent terminal ---
+  const [termFontFamily, setTermFontFamily] = useState(config.terminalFontFamily ?? DEFAULT_TERMINAL_FONT_FAMILY);
+  const [termFontSize, setTermFontSize] = useState(String(config.terminalFontSize ?? DEFAULT_TERMINAL_FONT_SIZE));
+  const [termFontNote, setTermFontNote] = useState('');
+  const saveTerminalFont = async () => {
+    const family = termFontFamily.trim() || DEFAULT_TERMINAL_FONT_FAMILY;
+    const parsed = parseInt(termFontSize, 10);
+    // Same 8–40px clamp as the per-terminal zoom, so a typo can't wedge the grid.
+    const size = Number.isNaN(parsed) ? DEFAULT_TERMINAL_FONT_SIZE : Math.min(40, Math.max(8, parsed));
+    try {
+      await window.cth.updateConfig({ terminalFontFamily: family, terminalFontSize: size });
+      // Mirror into the store so every mounted terminal re-applies it live
+      // (PtyTerminalView watches these — same pattern as the office theme).
+      useStore.getState().setTerminalFontFamily(family);
+      useStore.getState().setTerminalFontSizeDefault(size);
+      setTermFontFamily(family);
+      setTermFontSize(String(size));
+      setTermFontNote('saved');
+    } catch {
+      setTermFontNote('failed to save');
+    }
+    setTimeout(() => setTermFontNote(''), 2000);
   };
 
   // --- circuit-breaker config (Lane A #6 canonical fields, widened view) ---
@@ -804,6 +832,60 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                             {kgNote && <span style={{ fontSize: 12, color: 'var(--cth-mint)' }}>{kgNote}</span>}
                           </div>
                         )}
+                      </div>
+
+                      <div style={{ height: 1, background: 'var(--cth-ink-300)' }} />
+
+                      {/* Terminal font (#95) — family + default size for every agent
+                          terminal. Defaults byte-identical to the historical
+                          hardcoded look (VT323 / 14px). */}
+                      <div>
+                        <div style={{
+                          fontFamily: 'var(--cth-font-display)', fontSize: 8, lineHeight: '12px',
+                          color: 'var(--cth-ink-500)', textTransform: 'uppercase', marginBottom: 10
+                        }}>
+                          Terminal font
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                          <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                            Applies to every agent terminal. Pick a true monospace (e.g. Menlo) if the pixel
+                            font misaligns box-drawing in your TUIs. Per-terminal zoom still overrides the size
+                            for this session.
+                          </span>
+                          <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+                            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, ...slackLabelStyle }}>
+                              font family
+                              <input
+                                list="cth-terminal-font-presets"
+                                value={termFontFamily}
+                                onChange={(e) => setTermFontFamily(e.target.value)}
+                                placeholder={DEFAULT_TERMINAL_FONT_FAMILY}
+                                style={{ ...slackInputStyle, width: 260, fontFamily: 'var(--cth-font-mono, monospace)' }}
+                              />
+                              <datalist id="cth-terminal-font-presets">
+                                <option value="VT323, monospace" />
+                                <option value="Menlo, monospace" />
+                                <option value="Monaco, monospace" />
+                                <option value='"JetBrains Mono", Menlo, monospace' />
+                                <option value='"Courier New", monospace' />
+                                <option value="monospace" />
+                              </datalist>
+                            </label>
+                            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, ...slackLabelStyle }}>
+                              default size (px)
+                              <input
+                                type="number" min={8} max={40} step={1}
+                                value={termFontSize}
+                                onChange={(e) => setTermFontSize(e.target.value)}
+                                style={{ ...slackInputStyle, width: 100 }}
+                              />
+                            </label>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <PixelButton variant="secondary" size="sm" onClick={saveTerminalFont}>save</PixelButton>
+                            {termFontNote && <span style={{ fontSize: 12, color: 'var(--cth-mint)' }}>{termFontNote}</span>}
+                          </div>
+                        </div>
                       </div>
 
                       {/* Office Theme — TV-show office maps (experimental; flag tvShowOffices, default off) */}

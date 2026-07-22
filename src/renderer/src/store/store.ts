@@ -5,6 +5,7 @@ import type { ThemeId } from '@/scene/office/themeRegistry';
 import type { StatusKind } from '@/components/PixelBadge';
 import type { AgentProvider } from '@shared/agentProvider';
 import type { HireManifest } from '@shared/hire';
+import { DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_TERMINAL_FONT_SIZE } from '@/store/config';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -87,12 +88,6 @@ export interface Agent {
   seedPrompt?: string;
 }
 
-export interface FeedEntry {
-  agentId: string;
-  text: string;
-  ts: number;
-}
-
 /** A message the user has parked for an agent while its terminal was busy.
  *  Queued messages are drained one at a time when the agent next goes idle (see
  *  useHive's flush loop). */
@@ -130,8 +125,13 @@ interface State {
    *  registry entry reattach by themselves. God/assistant are excluded (they
    *  auto-respawn). */
   restorableAgents: Agent[];
+  /** Ids the user explicitly dismissed/forgot (✕ on an archived or restorable
+   *  entry). The hive registry never GCs agent ids, so the 15s reconcile would
+   *  otherwise re-adopt a "permanently forgotten" agent within one poll — these
+   *  tombstones make dismissal stick until the user spawns that id again
+   *  (addAgent clears the tombstone). Persisted in localStorage. */
+  dismissedRestorableIds: string[];
   selectedId: string | null;
-  feeds: Record<string, string[]>;
   addAgentOpen: boolean;
   fullscreenAgentId: string | null;
   fullscreenFilePath: string | null;
@@ -153,7 +153,6 @@ interface State {
   setGodStatus: (status: GodStatus) => void;
   select: (id: string) => void;
   updateAgent: (id: string, patch: Partial<Agent>) => void;
-  pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
   /** Archive an agent (its terminal was closed): move it from the active roster
@@ -212,6 +211,15 @@ interface State {
    *  on switch). OfficeFloor depends on this and rebuilds the scene on change. */
   officeTheme: ThemeId;
   setOfficeTheme: (theme: ThemeId) => void;
+  /** Mirror of config.terminalFontFamily (set by App on config load + Settings on
+   *  save) so every mounted PtyTerminalView re-applies it live — same pattern as
+   *  officeTheme. Defaults to the historical hardcoded family (#95). */
+  terminalFontFamily: string;
+  setTerminalFontFamily: (family: string) => void;
+  /** Mirror of config.terminalFontSize — the DEFAULT size for terminals without a
+   *  per-session zoom override (the localStorage zoom still wins). */
+  terminalFontSizeDefault: number;
+  setTerminalFontSizeDefault: (px: number) => void;
   /** Park a message for an agent. Returns nothing; the flush loop delivers it.
    *  `meta.instruction`, when set, is what gets typed into the PTY instead of
    *  `text` (UI/card surfaces still show `text`). */
@@ -240,6 +248,7 @@ const LS_SIDEBAR_TAB = 'cth.sidebarTab';
 const LS_AGENTS = 'cth.agents';
 const LS_ARCHIVED = 'cth.archivedAgents';
 const LS_RESTORABLE = 'cth.restorableAgents';
+const LS_DISMISSED = 'cth.dismissedRestorable';
 const LS_SELECTED = 'cth.selectedId';
 const LS_QUEUES = 'cth.messageQueues';
 
@@ -338,6 +347,22 @@ function loadPersistedRestorable(): Agent[] {
   }
 }
 
+function persistDismissed(ids: string[]): void {
+  try { window.localStorage.setItem(LS_DISMISSED, JSON.stringify(ids)); } catch { /* noop */ }
+}
+
+function loadPersistedDismissed(): string[] {
+  try {
+    const raw = window.localStorage.getItem(LS_DISMISSED);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((id): id is string => typeof id === 'string' && id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 function persistQueues(queues: Record<string, QueuedMessage[]>): void {
   try {
     // Only keep non-empty queues so the key stays small.
@@ -393,6 +418,7 @@ const initialSidebarTab: SidebarTab = (() => {
 const initialAgents = loadPersistedAgents();
 const initialArchivedAgents = loadPersistedArchived();
 const initialRestorableAgents = loadPersistedRestorable();
+const initialDismissedIds = loadPersistedDismissed();
 const initialSelectedId = loadPersistedSelectedId(initialAgents);
 const initialQueues = loadPersistedQueues();
 
@@ -408,8 +434,8 @@ export const useStore = create<State>((set) => ({
   agents: initialAgents,
   archivedAgents: initialArchivedAgents,
   restorableAgents: initialRestorableAgents,
+  dismissedRestorableIds: initialDismissedIds,
   selectedId: initialSelectedId,
-  feeds: {},
   addAgentOpen: false,
   ccTabRequest: null,
   requestCommandCenterTab: (tab) =>
@@ -427,9 +453,17 @@ export const useStore = create<State>((set) => ({
   setGodStatus: (status) => set({ godStatus: status }),
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id, ccTabRequest: null }; }),
   updateAgent: (id, patch) =>
-    set((s) => ({ agents: s.agents.map(a => a.id === id ? { ...a, ...patch } : a) })),
-  pushFeed: (id, line) =>
-    set((s) => ({ feeds: { ...s.feeds, [id]: [...(s.feeds[id] ?? []), line] } })),
+    set((s) => {
+      const agents = s.agents.map(a => a.id === id ? { ...a, ...patch } : a);
+      // Persist ONLY when the patch touches a durable spawn-recipe field —
+      // otherwise 'restart with model' changes (command/provider/model via
+      // CommandCenterPanel.restartWithModel) evaporate on app quit and the
+      // restorable/auto-revive paths respawn the OLD model. Status/action churn
+      // (every hook event) deliberately skips the localStorage write.
+      const DURABLE: ReadonlyArray<keyof Agent> = ['command', 'provider', 'model', 'cwd', 'worktreePath'];
+      if (DURABLE.some((k) => k in patch)) persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
   addAgent: (agent) =>
     set((s) => {
       // Idempotent by id: a MAIN-initiated spawn broadcast (hive:agentSpawned, e.g.
@@ -442,26 +476,29 @@ export const useStore = create<State>((set) => ({
       const archivedAgents = s.archivedAgents.filter((a) => a.id !== agent.id);
       // A live (re)spawn also consumes any restorable entry for the same id.
       const restorableAgents = s.restorableAgents.filter((a) => a.id !== agent.id);
+      // Spawning an id the user once dismissed lifts its tombstone — from here on
+      // the normal lifecycle (and the registry reconcile) may surface it again.
+      const dismissedRestorableIds = s.dismissedRestorableIds.filter((id) => id !== agent.id);
       persistAgents(agents, agent.id);
       persistArchived(archivedAgents);
       if (restorableAgents.length !== s.restorableAgents.length) persistRestorable(restorableAgents);
+      if (dismissedRestorableIds.length !== s.dismissedRestorableIds.length) persistDismissed(dismissedRestorableIds);
       return {
         agents,
         archivedAgents,
         restorableAgents,
-        selectedId: agent.id,
-        feeds: { ...s.feeds, [agent.id]: s.feeds[agent.id] ?? [] }
+        dismissedRestorableIds,
+        selectedId: agent.id
       };
     }),
   removeAgent: (id) =>
     set((s) => {
       const agents = s.agents.filter(a => a.id !== id);
-      const { [id]: _gone, ...feeds } = s.feeds;
       const { [id]: _queueGone, ...messageQueues } = s.messageQueues;
       const selectedId = s.selectedId === id ? (agents[0]?.id ?? null) : s.selectedId;
       persistAgents(agents, selectedId);
       if (_queueGone) persistQueues(messageQueues);
-      return { agents, feeds, selectedId, messageQueues };
+      return { agents, selectedId, messageQueues };
     }),
   archiveAgent: (id) =>
     set((s) => {
@@ -479,38 +516,55 @@ export const useStore = create<State>((set) => ({
         currentStation: undefined
       };
       const archivedAgents = [...s.archivedAgents.filter((a) => a.id !== id), archivedEntry];
-      const { [id]: _feedGone, ...feeds } = s.feeds;
       const { [id]: _queueGone, ...messageQueues } = s.messageQueues;
       const selectedId = s.selectedId === id ? (agents[0]?.id ?? null) : s.selectedId;
       persistAgents(agents, selectedId);
       persistArchived(archivedAgents);
       if (_queueGone) persistQueues(messageQueues);
-      return { agents, archivedAgents, feeds, selectedId, messageQueues };
+      return { agents, archivedAgents, selectedId, messageQueues };
     }),
   removeArchivedAgent: (id) =>
     set((s) => {
       if (!s.archivedAgents.some((a) => a.id === id)) return s;
       const archivedAgents = s.archivedAgents.filter((a) => a.id !== id);
+      // Tombstone the id: the registry keeps its record forever, so without this
+      // the 15s reconcile re-adopts the "permanently forgotten" agent into the
+      // restorable list within one poll. Cleared only by a fresh spawn (addAgent).
+      const dismissedRestorableIds = s.dismissedRestorableIds.includes(id)
+        ? s.dismissedRestorableIds
+        : [...s.dismissedRestorableIds, id];
       persistArchived(archivedAgents);
-      return { archivedAgents };
+      persistDismissed(dismissedRestorableIds);
+      return { archivedAgents, dismissedRestorableIds };
     }),
   removeRestorableAgent: (id) =>
     set((s) => {
       if (!s.restorableAgents.some((a) => a.id === id)) return s;
       const restorableAgents = s.restorableAgents.filter((a) => a.id !== id);
+      // Same tombstone as removeArchivedAgent — otherwise a dropped entry (user
+      // dismissal or restoreTeam's malformed-entry self-clean) is re-adopted from
+      // the registry within 15s, creating an unremovable zombie. A respawn of the
+      // id (addAgent) lifts the tombstone.
+      const dismissedRestorableIds = s.dismissedRestorableIds.includes(id)
+        ? s.dismissedRestorableIds
+        : [...s.dismissedRestorableIds, id];
       persistRestorable(restorableAgents);
-      return { restorableAgents };
+      persistDismissed(dismissedRestorableIds);
+      return { restorableAgents, dismissedRestorableIds };
     }),
   adoptRestorable: (candidates) =>
     set((s) => {
-      // An id that's already live on the floor, in the Archived view, or already
-      // queued as restorable must never be re-surfaced here — those are owned by
-      // the in-app lifecycle. Only agents the renderer has never seen (created
-      // OUTSIDE the UI) are adopted.
+      // An id that's already live on the floor, in the Archived view, already
+      // queued as restorable, OR explicitly dismissed by the user must never be
+      // re-surfaced here — the first three are owned by the in-app lifecycle and
+      // the tombstones keep "permanently forget" permanent (the registry never
+      // GCs ids). Only agents the renderer has never seen and never dismissed
+      // (created OUTSIDE the UI) are adopted.
       const known = new Set<string>([
         ...s.agents.map((a) => a.id),
         ...s.archivedAgents.map((a) => a.id),
-        ...s.restorableAgents.map((a) => a.id)
+        ...s.restorableAgents.map((a) => a.id),
+        ...s.dismissedRestorableIds
       ]);
       const fresh = candidates.filter((c) => c.id && !known.has(c.id));
       if (!fresh.length) return s;
@@ -538,6 +592,18 @@ export const useStore = create<State>((set) => ({
   setHasOpenAiKey: (has) => set({ hasOpenAiKey: has }),
   officeTheme: 'office',
   setOfficeTheme: (theme) => set({ officeTheme: theme }),
+  terminalFontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
+  setTerminalFontFamily: (family) =>
+    set({ terminalFontFamily: family.trim() || DEFAULT_TERMINAL_FONT_FAMILY }),
+  terminalFontSizeDefault: DEFAULT_TERMINAL_FONT_SIZE,
+  // Clamp to the same bounds as PtyTerminalView's zoom (8–40px) so a bad config
+  // value can't render an unusable grid.
+  setTerminalFontSizeDefault: (px) =>
+    set({
+      terminalFontSizeDefault: Number.isFinite(px)
+        ? Math.min(40, Math.max(8, Math.round(px)))
+        : DEFAULT_TERMINAL_FONT_SIZE
+    }),
   enqueueMessage: (agentId, text, meta) =>
     set((s) => {
       const trimmed = text.trim();
@@ -583,14 +649,12 @@ export const useStore = create<State>((set) => ({
         ...s.restorableAgents.filter((r) => !dead.some((d) => d.id === r.id)),
         ...dead
       ];
-      const feeds: Record<string, string[]> = {};
-      for (const a of agents) feeds[a.id] = s.feeds[a.id] ?? [];
       const selectedId = agents.some((a) => a.id === s.selectedId)
         ? s.selectedId
         : (agents[0]?.id ?? null);
       persistAgents(agents, selectedId);
       persistRestorable(restorableAgents);
-      return { agents, feeds, selectedId, restorableAgents };
+      return { agents, selectedId, restorableAgents };
     }),
   setAddAgentOpen: (open) => set({ addAgentOpen: open }),
   pendingHire: null,

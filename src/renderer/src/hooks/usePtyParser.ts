@@ -51,7 +51,6 @@ const CONTEXT_LIMIT_RE = /[\d.,]+k\s*\/\s*([\d.]+)([km])\s+tokens/i;
  */
 export function usePtyParser(agentId: string) {
   const updateAgent = useStore(s => s.updateAgent);
-  const pushFeed = useStore(s => s.pushFeed);
   const idleTimerRef = useRef<number | null>(null);
 
   const scheduleIdle = useCallback(() => {
@@ -128,9 +127,6 @@ export function usePtyParser(agentId: string) {
         currentStation: station,
         carrying
       });
-      // Mirror into the in-app feed so the mock terminal view shows it too if
-      // ever toggled — harmless for real ptys.
-      pushFeed(agentId, `\x1b[36m● ${lastTool}\x1b[0m ${lastArg ?? ''}`);
       // Keep working while the spinner is up; otherwise allow the idle drift.
       if (running) cancelIdle(); else scheduleIdle();
       return;
@@ -180,5 +176,5 @@ export function usePtyParser(agentId: string) {
 
     // Turn finished, no prompt on screen → let it drift to idle.
     scheduleIdle();
-  }, [agentId, updateAgent, pushFeed, scheduleIdle, cancelIdle]);
+  }, [agentId, updateAgent, scheduleIdle, cancelIdle]);
 }

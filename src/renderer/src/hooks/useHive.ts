@@ -8,7 +8,7 @@ import {
   tokenizeCommand,
   type HarnessConfig
 } from '@/store/config';
-import { acquireTerminal, resetTerminal } from '@/components/terminalPool';
+import { acquireTerminal, resetTerminal, disposeTerminal } from '@/components/terminalPool';
 import { OFFICE_CAST, DEFAULT_CHARACTER } from '@/scene/office/cast';
 
 const GOD_ID = 'god';
@@ -105,9 +105,16 @@ function submitToPty(ptyId: string, text: string, settleMs = 250): Promise<void>
     // commands) is sent raw — some TUIs (Antigravity's agy) treat the paste
     // markers as literal input and never submit, so skipping them is more robust.
     const payload = text.includes('\n') ? `\x1b[200~${text}\x1b[201~` : text;
-    await window.cth.writePty(ptyId, payload);
+    // writePty NEVER rejects for a dead pty — it resolves { ok:false, error:
+    // 'no pty: …' } — so an unchecked await here made every failed delivery look
+    // successful (the queue-drain then destroyed the message it had already
+    // popped, #36). Surface the failure as a rejection; the chain itself is
+    // immune (the prev.catch above absorbs it for the next writer).
+    const wrote = await window.cth.writePty(ptyId, payload);
+    if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, 140));
-    await window.cth.writePty(ptyId, '\r');
+    const submitted = await window.cth.writePty(ptyId, '\r');
+    if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, settleMs));
   });
   writeChains.set(ptyId, next);
@@ -200,6 +207,13 @@ export function useHive(config: HarnessConfig | null): void {
   // 'working' (there's a short window where it still reads 'idle' right after we
   // type into it). One message per cooldown keeps delivery strictly one-by-one.
   const lastFlush = useRef<Record<string, number>>({});
+  // Queue-drain delivery tracking (#36): a message now stays IN the queue until
+  // its PTY write chain resolves, so `inFlightSends` (message ids mid-write)
+  // stops a store-update burst from double-sending the head, and `sendFailures`
+  // bounds retries — after MAX_SEND_ATTEMPTS failed writes the message is
+  // dropped WITH a console.warn instead of being silently destroyed.
+  const inFlightSends = useRef<Set<string>>(new Set());
+  const sendFailures = useRef<Record<string, number>>({});
   // In-flight spawn guard so a re-render / StrictMode double-mount can't spawn
   // Michael twice (the window between the listPtys check and spawnPty is racy).
   const godSpawning = useRef(false);
@@ -511,26 +525,44 @@ export function useHive(config: HarnessConfig | null): void {
     return () => clearInterval(iv);
   }, [config?.onboardingComplete]);
 
-  // 3) Wake idle agents holding unread inbox messages. The assistant is
+  // 3) Wake IDLE agents holding unread inbox messages. The assistant is
   //    send-only (it never receives inbox mail), so it's excluded.
   useEffect(() => {
-    if (!config?.onboardingComplete) return;
+    if (!config?.onboardingComplete || !config.harnessHome) return;
+    const home = config.harnessHome;
     const iv = setInterval(async () => {
       const now = Date.now();
+      // STRICTLY idle (#5 — permission-prompt safety). 'waiting'/'blocked' mean a
+      // real approval/notification prompt is on screen (hook Notification
+      // needs-human → effect #2; BLOCK_HINTS like "❯ 1. Yes" → usePtyParser), and
+      // submitToPty always follows its text with a bare '\r' — at a Claude Code
+      // menu that Enter SILENTLY CONFIRMS the highlighted "1. Yes". So the nudge
+      // never types into a prompted agent; it simply defers (nudged is only
+      // stamped when we actually type) and fires once the prompt clears and the
+      // agent drifts idle. This matches the queue-drain's idle-only gate (#4).
       const agents = useStore.getState().agents.filter(
-        (a) => a.ptyId && (a.status === 'idle' || a.status === 'waiting')
+        (a) => a.ptyId && a.status === 'idle'
           // Don't type into an agent still running its boot sequence — the nudge
           // would collide with /remote-control + the orientation prompt.
           && (bootGraceUntil.current[a.id] ?? 0) < now
       );
       for (const a of agents) {
         try {
-          const inbox = await window.cth.hiveInbox(a.id);
+          // The newest message id IS the newest filename — deliver() writes
+          // `${msg.id}.json` — so a readdir answers "anything new?" without
+          // hive:inbox's read + JSON-parse of EVERY pending message body every
+          // 4s (#29). `.done` is a subdirectory and atomic-write temp files end
+          // in `.tmp-…`, so the .json filter excludes both.
+          const res = await window.cth.listDir(home, `agents/${a.id}/inbox`);
+          const newest = res.ok
+            ? res.entries
+                .filter((e) => !e.isDir && e.name.endsWith('.json'))
+                .map((e) => e.name.slice(0, -'.json'.length))
+                .sort()
+                .slice(-1)[0] ?? ''
+            : '';
           // Dedup by the newest message id, not the count — a count can oscillate
           // as messages drain and re-arrive, which would re-nudge for the same set.
-          const newest = inbox.length
-            ? inbox.map((m) => m.id).sort().slice(-1)[0]
-            : '';
           if (newest && nudged.current[a.id] !== newest) {
             nudged.current[a.id] = newest;
             await submitToPty(
@@ -544,7 +576,7 @@ export function useHive(config: HarnessConfig | null): void {
       }
     }, 4000);
     return () => clearInterval(iv);
-  }, [config?.onboardingComplete]);
+  }, [config?.onboardingComplete, config?.harnessHome]);
 
   // 3b) Seed a fresh "type-into-tui" worker (Crush) with the hive protocol. Its
   //     bare TUI rejects a positional seed (Cobra reads it as a subcommand →
@@ -568,6 +600,18 @@ export function useHive(config: HarnessConfig | null): void {
         // Clear the record now so it isn't re-seen (the ref also guards) or persisted.
         updateAgent(a.id, { seedPrompt: undefined });
         setTimeout(() => {
+          // Permission-prompt safety (#5): if the worker surfaced an approval /
+          // needs-human prompt while its TUI booted ('waiting'/'blocked'), the
+          // seed's trailing Enter would confirm it. Put the seed back and let a
+          // later tick retry once the prompt clears; if the agent vanished
+          // (killed mid-boot), don't type into its orphaned pty at all.
+          const live = useStore.getState().agents.find((x) => x.id === a.id);
+          if (!live) return;
+          if (live.status === 'waiting' || live.status === 'blocked') {
+            seeded.current.delete(a.id);
+            useStore.getState().updateAgent(a.id, { seedPrompt: seed });
+            return;
+          }
           submitToPty(ptyId, seed).catch(() => { /* pty may have died */ });
         }, GOD_BOOT_MS);
       }
@@ -582,32 +626,65 @@ export function useHive(config: HarnessConfig | null): void {
   useEffect(() => {
     if (!config?.onboardingComplete) return;
     const FLUSH_COOLDOWN_MS = 4500;
+    // A message that fails this many PTY writes (dead/crashed pty that the store
+    // still thinks is idle) is dropped WITH a console.warn — bounded so the drain
+    // never spins forever on a corpse, loud so the loss is diagnosable.
+    const MAX_SEND_ATTEMPTS = 3;
 
     // Send the front of `srcId`'s queue into `target`'s pty (verbatim or wrapped),
     // gated on the target being idle + off cooldown. Keyed cooldown per target so
-    // strict one-by-one delivery holds. Returns true if it dispatched.
+    // strict one-by-one delivery holds. Returns true if it INITIATED a send (the
+    // message is only removed from the queue once the write chain resolves).
     const dispatch = (srcId: string, target: Agent | undefined, wrap?: (m: QueuedMessage) => string): boolean => {
-      const { messageQueues, removeQueuedMessage } = useStore.getState();
+      const { messageQueues } = useStore.getState();
       const next = messageQueues[srcId]?.[0];
       if (!next || !target?.ptyId || target.status !== 'idle') return false;
+      // Already mid-write — the head hasn't been confirmed delivered yet.
+      if (inFlightSends.current.has(next.id)) return false;
       const now = Date.now();
       // Hold queued messages until the target finishes its boot sequence.
       if ((bootGraceUntil.current[target.id] ?? 0) >= now) return false;
       if (now - (lastFlush.current[target.id] ?? 0) < FLUSH_COOLDOWN_MS) return false;
       lastFlush.current[target.id] = now;
-      // Remove first so a burst of store updates can't double-send the same one.
-      removeQueuedMessage(srcId, next.id);
-      // Zero the gauge instantly on /clear — the new session's context isn't
-      // known until statusLine fires after the first post-clear response, so
-      // leaving it at the old value shows a stale-full bar during that window.
-      if (next.text.trim().toLowerCase() === '/clear') {
-        useStore.getState().updateAgent(target.id, { contextTokens: 0, contextLimit: undefined, progress: 0 });
-      }
+      // Remove only AFTER the write chain confirms delivery (#36). The old
+      // remove-first ordering + writePty's resolve-on-{ok:false} contract meant a
+      // message to a crashed-but-'idle' agent was popped, the write failed, and
+      // nothing ever heard about it — one message silently destroyed per cooldown.
+      // Double-send safety now comes from inFlightSends + the cooldown above.
+      inFlightSends.current.add(next.id);
+      const ptyId = target.ptyId;
+      const targetId = target.id;
       // `instruction` (when present) is the authoritative text to type into the
       // PTY — e.g. Slack-origin work carries the autonomy preamble there while the
       // kanban card keeps `text` (raw) as its readable title. UI/card surfaces
       // never read `instruction`, so this stays invisible to the human board.
-      submitToPty(target.ptyId, wrap ? wrap(next) : (next.instruction ?? next.text)).catch(() => { /* pty may have died */ });
+      submitToPty(ptyId, wrap ? wrap(next) : (next.instruction ?? next.text))
+        .then(() => {
+          inFlightSends.current.delete(next.id);
+          delete sendFailures.current[next.id];
+          useStore.getState().removeQueuedMessage(srcId, next.id);
+          // Zero the gauge on a DELIVERED /clear — the new session's context isn't
+          // known until statusLine fires after the first post-clear response, so
+          // leaving it at the old value shows a stale-full bar during that window.
+          if (next.text.trim().toLowerCase() === '/clear') {
+            useStore.getState().updateAgent(targetId, { contextTokens: 0, contextLimit: undefined, progress: 0 });
+          }
+        })
+        .catch((err) => {
+          inFlightSends.current.delete(next.id);
+          const attempts = (sendFailures.current[next.id] ?? 0) + 1;
+          sendFailures.current[next.id] = attempts;
+          if (attempts >= MAX_SEND_ATTEMPTS) {
+            delete sendFailures.current[next.id];
+            useStore.getState().removeQueuedMessage(srcId, next.id);
+            console.warn(
+              `[queue-drain] dropping message ${next.id} for ${targetId} after ${attempts} failed pty writes ` +
+              `("${next.text.slice(0, 80)}${next.text.length > 80 ? '…' : ''}")`,
+              err
+            );
+          }
+          // else: still queued — the cooldown-spaced flush retries it.
+        });
       return true;
     };
 
@@ -756,7 +833,19 @@ export function useHive(config: HarnessConfig | null): void {
       useStore.getState().addAgent(agent);
     });
     const offArchive = window.cth.onHiveAgentArchived?.((e) => {
-      if (e?.id) useStore.getState().archiveAgent(e.id);
+      if (!e?.id) return;
+      // Capture the pty BEFORE archiveAgent clears it. MAIN-spawned agents use
+      // ptyId === agent id (see offSpawn above), so fall back to the raw id for
+      // pool entries the renderer pre-warmed but never carded.
+      const ptyId = useStore.getState().agents.find((a) => a.id === e.id)?.ptyId ?? e.id;
+      useStore.getState().archiveAgent(e.id);
+      // The pty is already dead in main (voice kill emits this broadcast) — tear
+      // down the pooled terminal like the in-renderer kill paths do
+      // (AgentDetailPanel/FullscreenTerminal onKill). Without this every voice
+      // kill leaked a 10k-line buffer, three per-pty IPC listeners and (if ever
+      // viewed) a WebGL context for the app's lifetime. disposeTerminal is
+      // idempotent and a no-op for unknown ids.
+      disposeTerminal(ptyId);
     });
     return () => { offSpawn?.(); offArchive?.(); };
   }, [config?.onboardingComplete]);
@@ -886,11 +975,18 @@ export function useHive(config: HarnessConfig | null): void {
         if (cancelled || !reg?.agents) return;
         const livePty = new Set(ptys.map((p) => p.id));
         const onFloor = new Set(useStore.getState().agents.map((a) => a.id));
+        // Tombstoned ids: the user hit ✕ ("permanently forget") on this agent.
+        // The registry never GCs ids, so without this check the reconcile would
+        // resurrect every dismissed agent within 15s — dismissal must win until
+        // the user explicitly spawns that id again (addAgent lifts the tombstone).
+        // adoptRestorable also checks, but skipping here keeps the loop cheap.
+        const dismissed = new Set(useStore.getState().dismissedRestorableIds);
         const candidates: Agent[] = [];
         for (const [id, meta] of Object.entries(reg.agents)) {
           if (id === reg.godId || meta.isGod) continue;   // Michael auto-boots; never restorable
           if (meta.isAssistant) continue;                 // send-only prep assistant; auto-boots
           if (onFloor.has(id)) continue;                  // already live on the floor
+          if (dismissed.has(id)) continue;                // user said "forget" — stays forgotten
           if (livePty.has(id) || livePty.has(`pty-${id}`)) continue; // already owns a managed PTY
           candidates.push({
             id,

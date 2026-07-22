@@ -3,8 +3,8 @@ import type { CSSProperties } from 'react';
 import '@xterm/xterm/css/xterm.css';
 import { Icon } from './Icon';
 import { acquireTerminal, attachTerminal } from './terminalPool';
+import { useStore } from '@/store/store';
 
-const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 40;
 
@@ -13,12 +13,14 @@ const LS_THEME = 'cth.ptyTheme';
 
 type PtyTheme = 'light' | 'dark';
 
-function loadFontSize(): number {
+/** The user's per-session zoom override, or null to follow the configured
+ *  default size (config.terminalFontSize, mirrored into the store — #95). */
+function loadFontSizeOverride(): number | null {
   try {
     const n = parseInt(window.localStorage.getItem(LS_FONT_SIZE) ?? '', 10);
     if (!Number.isNaN(n) && n >= MIN_FONT_SIZE && n <= MAX_FONT_SIZE) return n;
   } catch { /* noop */ }
-  return DEFAULT_FONT_SIZE;
+  return null;
 }
 
 function loadTheme(): PtyTheme {
@@ -131,7 +133,17 @@ export function PtyTerminalView({ ptyId, onStreamData, onUserPrompt, onToggleFul
   onStreamDataRef.current = onStreamData;
   const onUserPromptRef = useRef(onUserPrompt);
   onUserPromptRef.current = onUserPrompt;
-  const [fontSize, setFontSize] = useState(loadFontSize);
+  // Configured terminal font (#95): family + default size come from the store
+  // mirror of the harness config; the localStorage zoom stays a per-session
+  // override on top of the configured size (null = follow the config).
+  const cfgFontFamily = useStore((s) => s.terminalFontFamily);
+  const cfgFontSize = useStore((s) => s.terminalFontSizeDefault);
+  const cfgFontSizeRef = useRef(cfgFontSize);
+  cfgFontSizeRef.current = cfgFontSize;
+  const fontFamilyRef = useRef(cfgFontFamily);
+  fontFamilyRef.current = cfgFontFamily;
+  const [fontOverride, setFontOverride] = useState<number | null>(loadFontSizeOverride);
+  const fontSize = fontOverride ?? cfgFontSize;
   const fontSizeRef = useRef(fontSize);
   const [ptyTheme, setPtyTheme] = useState<PtyTheme>(loadTheme);
   const ptyThemeRef = useRef(ptyTheme);
@@ -144,7 +156,7 @@ export function PtyTerminalView({ ptyId, onStreamData, onUserPrompt, onToggleFul
   useEffect(() => {
     const container = hostRef.current;
     if (!container) return;
-    const entry = acquireTerminal(ptyId, THEMES[ptyThemeRef.current], fontSizeRef.current);
+    const entry = acquireTerminal(ptyId, THEMES[ptyThemeRef.current], fontSizeRef.current, fontFamilyRef.current);
     entry.term.options.theme = THEMES[ptyThemeRef.current];
     entry.term.options.fontSize = fontSizeRef.current;
     attachTerminal(entry, container);
@@ -254,20 +266,45 @@ export function PtyTerminalView({ ptyId, onStreamData, onUserPrompt, onToggleFul
   // Apply theme changes to the pooled terminal and persist the choice.
   useEffect(() => {
     try { window.localStorage.setItem(LS_THEME, ptyTheme); } catch { /* noop */ }
-    acquireTerminal(ptyId, THEMES[ptyTheme], fontSizeRef.current).term.options.theme = THEMES[ptyTheme];
+    acquireTerminal(ptyId, THEMES[ptyTheme], fontSizeRef.current, fontFamilyRef.current).term.options.theme = THEMES[ptyTheme];
   }, [ptyTheme, ptyId]);
 
-  // Apply font-size (zoom) changes to the pooled terminal and re-fit cols/rows.
+  // Apply font-size changes (zoom override OR a new configured default) to the
+  // pooled terminal and re-fit cols/rows.
   useEffect(() => {
     fontSizeRef.current = fontSize;
-    try { window.localStorage.setItem(LS_FONT_SIZE, String(fontSize)); } catch { /* noop */ }
-    const entry = acquireTerminal(ptyId, THEMES[ptyThemeRef.current], fontSize);
+    const entry = acquireTerminal(ptyId, THEMES[ptyThemeRef.current], fontSize, fontFamilyRef.current);
     entry.term.options.fontSize = fontSize;
     try {
       entry.fit.fit();
       window.cth.resizePty(ptyId, entry.term.cols, entry.term.rows);
     } catch { /* host may not be sized yet */ }
   }, [fontSize, ptyId]);
+
+  // Persist the zoom override; clearing it (reset) removes the key so the view
+  // follows the configured default size again.
+  useEffect(() => {
+    try {
+      if (fontOverride === null) window.localStorage.removeItem(LS_FONT_SIZE);
+      else window.localStorage.setItem(LS_FONT_SIZE, String(fontOverride));
+    } catch { /* noop */ }
+  }, [fontOverride]);
+
+  // Apply a configured font-family change live (#95). Assign only when it
+  // actually differs — a same-value write still forces xterm to re-measure, and
+  // the attach effect's font-load path already does that deliberately. Changing
+  // family invalidates the WebGL glyph atlas and the measured cell, so clear the
+  // atlas and refit exactly like the font-load path above.
+  useEffect(() => {
+    const entry = acquireTerminal(ptyId, THEMES[ptyThemeRef.current], fontSizeRef.current, cfgFontFamily);
+    if (entry.term.options.fontFamily === cfgFontFamily) return;
+    entry.term.options.fontFamily = cfgFontFamily;
+    try { entry.term.clearTextureAtlas?.(); } catch { /* noop */ }
+    try {
+      entry.fit.fit();
+      window.cth.resizePty(ptyId, entry.term.cols, entry.term.rows);
+    } catch { /* host may not be sized yet */ }
+  }, [cfgFontFamily, ptyId]);
 
   // Drag-and-drop a file (image, etc.) onto the terminal → inject its absolute
   // path into the pty, exactly like a native terminal's drag-drop. Claude Code
@@ -315,9 +352,13 @@ export function PtyTerminalView({ ptyId, onStreamData, onUserPrompt, onToggleFul
     void window.cth.writePty(ptyId, paths.join(' ') + ' ');
   };
 
+  // Functional updates keep the stale-closure keydown listener below correct;
+  // the cfg ref supplies the configured default when no override exists yet.
   const zoom = (delta: number) =>
-    setFontSize((s) => Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, s + delta)));
-  const resetZoom = () => setFontSize(DEFAULT_FONT_SIZE);
+    setFontOverride((o) =>
+      Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, (o ?? cfgFontSizeRef.current) + delta)));
+  // Reset = drop the override and follow the configured default size again.
+  const resetZoom = () => setFontOverride(null);
 
   // Keyboard zoom: Cmd/Ctrl + '=' / '-' / '0'
   useEffect(() => {

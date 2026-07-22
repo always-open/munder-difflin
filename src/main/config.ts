@@ -242,6 +242,14 @@ export interface HarnessConfig {
    *  ("theme" key) at spawn so the TUI's truecolor palette matches. Scoped to
    *  harness agents only; the user's global Claude theme is never touched. */
   terminalTheme?: 'light' | 'dark';
+  /** xterm font family for the renderer's pooled terminals (#95). Purely a
+   *  renderer concern (never read at spawn); lives here so it persists with the
+   *  rest of the config. Unset = the renderer's historical hardcoded
+   *  'VT323, monospace' (zero behavior change). */
+  terminalFontFamily?: string;
+  /** Default xterm font size (px) for terminals without a per-session zoom
+   *  override (#95). Unset = the renderer's historical hardcoded 14. */
+  terminalFontSize?: number;
   /** Master flag for the TV-show office themes feature (Settings theme picker +
    *  destructive switch flow). Default false = the picker is hidden and the
    *  office renders as today (zero behavior change). */

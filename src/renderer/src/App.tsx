@@ -18,7 +18,7 @@ import { PixelPanel } from '@/components/PixelPanel';
 import { PixelButton } from '@/components/PixelButton';
 import { Icon } from '@/components/Icon';
 import { SidebarSplitter } from '@/components/SidebarSplitter';
-import { acquireTerminal } from '@/components/terminalPool';
+import { acquireTerminal, disposeTerminal } from '@/components/terminalPool';
 import { FullscreenTerminal } from '@/components/FullscreenTerminal';
 import { TaskDetailOverlay } from '@/components/TaskDetailOverlay';
 import { FullscreenFileEditor } from '@/components/FullscreenFileEditor';
@@ -58,6 +58,11 @@ export function App() {
     return false;
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // True once the startup live-PTY reconcile has pruned dead persisted agents —
+  // gates the terminal pre-warm below so we never build pool entries (per-pty IPC
+  // listeners + 10k-line buffers) for last session's dead ptys that nothing would
+  // ever dispose (#10).
+  const [ptysReconciled, setPtysReconciled] = useState(false);
   const [quitWarn, setQuitWarn] = useState<{ ptyCount: number } | null>(null);
   const [closing, setClosing] = useState<ClosingTimeState | null>(null);
   const [vpWidth, setVpWidth] = useState<number>(window.innerWidth);
@@ -78,6 +83,13 @@ export function App() {
       // Mirror the active office theme so OfficeFloor renders it (gated on the
       // tvShowOffices flag; off = always the office). Settings keeps this synced.
       useStore.getState().setOfficeTheme(c.tvShowOffices ? (c.officeTheme ?? 'office') : 'office');
+      // Mirror the terminal font config (#95) so PtyTerminalView applies it live;
+      // unset fields fall back to the historical hardcoded look inside the
+      // setters (family) / via the ?? default (size).
+      useStore.getState().setTerminalFontFamily(c.terminalFontFamily ?? '');
+      if (typeof c.terminalFontSize === 'number') {
+        useStore.getState().setTerminalFontSizeDefault(c.terminalFontSize);
+      }
     });
     // Mirror BYOK OpenAI key presence (boolean only; the key never leaves main) so the
     // Realtime Michael voice toggle can gate on it. Lives in the secret broker, not
@@ -145,9 +157,18 @@ export function App() {
   // Pre-warm a persistent terminal for every live agent so its output is
   // buffered from spawn. Switching agents then re-attaches an already-rendered
   // terminal instantly (with full history) instead of building a blank one.
+  // Held until the live-PTY reconcile has run (#10): before it, the persisted
+  // roster still contains last session's DEAD agents, and pre-warming those
+  // created pool entries (IPC listeners, 10k-line buffers) that were never
+  // disposed. The mounted view acquires its own terminal, so the selected agent
+  // is never blocked on this.
   useEffect(() => {
-    for (const a of agents) if (a.ptyId) acquireTerminal(a.ptyId);
-  }, [agents]);
+    if (!ptysReconciled) return;
+    const s = useStore.getState();
+    for (const a of agents) {
+      if (a.ptyId) acquireTerminal(a.ptyId, undefined, s.terminalFontSizeDefault, s.terminalFontFamily);
+    }
+  }, [agents, ptysReconciled]);
 
   // Synthetic demo loop — CAGED (#5B). It must never animate alongside a live
   // hive (it would fire fake envelope handoffs and step seeded agents). Run it
@@ -175,8 +196,20 @@ export function App() {
     let cancelled = false;
     window.cth.listPtys().then((list) => {
       if (cancelled) return;
+      const live = new Set(list.map((p) => p.id));
+      // Snapshot the agents about to be dropped BEFORE the store prunes them —
+      // if a view already pooled a terminal for one (e.g. the restored selection
+      // mounted first), that entry must be disposed here or it leaks its IPC
+      // listeners + buffer for the app's lifetime (#10).
+      const dead = useStore.getState().agents.filter((a) => a.ptyId && !live.has(a.ptyId));
       useStore.getState().reconcileWithLivePtys(list.map((p) => p.id));
-    }).catch(() => { /* ignore — keep restored agents as-is */ });
+      for (const d of dead) disposeTerminal(d.ptyId!);
+      setPtysReconciled(true);
+    }).catch(() => {
+      // Reconcile unavailable — keep restored agents as-is, and let the pre-warm
+      // proceed against them (same behavior as before the gate existed).
+      if (!cancelled) setPtysReconciled(true);
+    });
     return () => { cancelled = true; };
   }, [config?.onboardingComplete]);
 
