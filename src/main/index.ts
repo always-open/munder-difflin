@@ -2527,7 +2527,10 @@ const closingTime = new ClosingTimeController(
   () => teardownAndQuit(),
   // #7C.2 steering — the graceful interrupt that reaches deeply busy agents
   // at their next hook boundary instead of waiting for a Stop.
-  control
+  control,
+  // #59 idle-and-clean fast-track: ms of PTY output silence for an agent, so
+  // closing time skips the ACK round-trip for workers with nothing to save.
+  (agentId) => { const ptyId = ptyForAgent(agentId); return ptyId ? ptyManager.idleFor(ptyId) : undefined; }
 );
 hive.setRoutedObserver((msg, targets) => closingTime.onRouted(msg, targets));
 ipcMain.handle('app:startClosingTime', () => closingTime.start());

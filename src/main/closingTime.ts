@@ -46,6 +46,13 @@ const COMPLETE_RE = /CLOSING[-_\s]*TIME[-_\s]*COMPLETE/i;
 /** How long to wait before surfacing "this is taking long — force quit?".
  *  Compaction or a long tool call can easily hold an ACK for a few minutes. */
 const TIMEOUT_MS = 6 * 60_000;
+/** Fast-track threshold (issue #59): a worker at least this quiet (no PTY
+ *  output) with an EMPTY inbox has nothing in working memory to save — waking
+ *  it just to say "nothing to report" costs a full agent turn and holds the
+ *  shutdown. Conservative so a mid-turn agent that is momentarily quiet is
+ *  still waited on. Deliberately the cheap two-signal check — no per-agent
+ *  `git status` exec inside start(). */
+const IDLE_SKIP_MS = 120_000;
 /** Grace after COMPLETE before tearing down, so the god's final commit/log
  *  writes land on disk and the floor visibly concludes. */
 const TEARDOWN_GRACE_MS = 2_500;
@@ -71,7 +78,11 @@ export class ClosingTimeController {
     /** Mid-run steering (#7C.2): lets closing time reach DEEPLY BUSY agents at
      *  their next hook boundary instead of waiting for the Stop-hook inbox
      *  drain — the graceful interrupt. Optional so tests can omit it. */
-    private control?: ControlRegistry
+    private control?: ControlRegistry,
+    /** ms since an agent's PTY last produced output (undefined = unknown).
+     *  Feeds the idle-and-clean fast-track (#59). Optional so tests can omit
+     *  it — without it every live worker is waited on, the old behavior. */
+    private idleForMs?: (id: string) => number | undefined
   ) {}
 
   isActive(): boolean {
@@ -96,18 +107,28 @@ export class ClosingTimeController {
 
     // Only agents with a live terminal are waited on — the registry is just
     // metadata here (names + god/assistant flags), never the roster source.
-    this.workers = new Set(
-      [...live].filter((id) => {
-        const a = reg.agents[id];
-        return id !== this.godId && !!a && !a.isGod;
-      })
-    );
+    const candidates = [...live].filter((id) => {
+      const a = reg.agents[id];
+      return id !== this.godId && !!a && !a.isGod;
+    });
+    // #59 fast-track: a worker that has been quiet for IDLE_SKIP_MS with an
+    // empty inbox has no in-flight state to save — drop it from the ACK
+    // roster so the shutdown doesn't pay a wake-up turn per idle agent.
+    const skipped: string[] = [];
+    this.workers = new Set(candidates.filter((id) => {
+      const idleMs = this.idleForMs?.(id);
+      let backlog = 0;
+      try { backlog = this.hive.inboxBacklog(id); } catch { backlog = 1; /* unknown → wait on it */ }
+      const skip = typeof idleMs === 'number' && idleMs >= IDLE_SKIP_MS && backlog === 0;
+      if (skip) skipped.push(id);
+      return !skip;
+    }));
     this.acked = new Set();
     this.active = true;
 
-    const names = [...this.workers]
-      .map((id) => `${reg.agents[id]?.name ?? id} (${id})`)
-      .join(', ') || '(none — the floor is just you)';
+    const nameOf = (id: string): string => `${reg.agents[id]?.name ?? id} (${id})`;
+    const names = [...this.workers].map(nameOf).join(', ') || '(none — the floor is just you)';
+    const skippedNames = skipped.map(nameOf).join(', ');
 
     this.hive.send({
       to: 'god',
@@ -116,14 +137,21 @@ export class ClosingTimeController {
       body: [
         'The human pressed "closing time": the harness will close as soon as you confirm the floor is safe. Run this protocol now, before anything else:',
         '',
-        `1. BROADCAST closing time to the team (message with "to":"broadcast"). Current workers: ${names}.`,
+        skipped.length
+          ? `1. Send the closing-time instruction DIRECTLY to each active worker (individual messages, NOT a broadcast — the idle agents listed below must not be woken). Active workers: ${names}.`
+          : `1. BROADCAST closing time to the team (message with "to":"broadcast"). Current workers: ${names}.`,
         '   Tell each worker to immediately: park or commit any work-in-progress safely, append its current state + concrete next steps to its memory.md, and then reply to you with a message whose subject is exactly "CLOSING-TIME-ACK".',
         '2. WAIT and keep draining your inbox until EVERY worker above has sent its CLOSING-TIME-ACK. Nudge stragglers once if needed.',
         '3. Save your own state: update board.md and append your shift summary to your memory.md.',
         `4. CONCLUDE by sending a message with "to":"human" and the subject exactly "CLOSING-TIME-COMPLETE" — the harness watches for it and closes the app. Do not send it before every worker has acked: the harness independently verifies the ACKs and will reject a premature conclusion.`,
         '',
+        ...(skipped.length
+          ? [`Fast-tracked by the harness (idle ≥2min with an empty inbox — nothing in working memory to save): ${skippedNames}. Do NOT message them and do NOT wait for an ACK from them.`]
+          : []),
         this.workers.size === 0
-          ? 'There are no workers on the floor right now — do steps 3 and 4 immediately.'
+          ? (skipped.length
+            ? 'Every worker is already idle and clean — the harness fast-tracked them all; do steps 3 and 4 immediately.'
+            : 'There are no workers on the floor right now — do steps 3 and 4 immediately.')
           : 'The prep assistant saves its own memory separately — do NOT wait for it and do not message it.',
         'This is a shutdown: do not start new work and do not accept new tasks.'
       ].join('\n')
