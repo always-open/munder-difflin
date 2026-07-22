@@ -2,6 +2,7 @@ import * as pty from 'node-pty';
 import type { WebContents } from 'electron';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { ensureKilled } from './procKill';
 
 interface PtySession {
   id: string;
@@ -99,7 +100,14 @@ export class PtyManager {
    *  terminals don't linger as orphaned processes writing to a dead webContents. */
   killByOwner(wc: WebContents): void {
     for (const [id, s] of [...this.sessions.entries()]) {
-      if (s.owner === wc) { try { s.proc.kill(); } catch { /* already gone */ } void id; }
+      if (s.owner === wc) {
+        try {
+          const pid = s.proc.pid;
+          s.proc.kill();
+          ensureKilled(pid);
+        } catch { /* already gone */ }
+        void id;
+      }
     }
   }
 
@@ -346,7 +354,9 @@ export class PtyManager {
     const s = this.sessions.get(id);
     if (!s) return { ok: false, error: `no pty: ${id}` };
     try {
+      const pid = s.proc.pid;
       s.proc.kill();
+      ensureKilled(pid); // verify + sweep the process group so no PID leaks
       this.sessions.delete(id);
       return { ok: true };
     } catch (e) {
@@ -383,7 +393,11 @@ export class PtyManager {
   killAll() {
     this.exitHandler = null;
     for (const s of this.sessions.values()) {
-      try { s.proc.kill(); } catch { /* noop */ }
+      try {
+        const pid = s.proc.pid;
+        s.proc.kill();
+        ensureKilled(pid);
+      } catch { /* noop */ }
     }
     this.sessions.clear();
   }

@@ -16,6 +16,7 @@
 import { existsSync, statSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { ensureKilled } from './procKill';
 
 /** Non-memory files `mempalace mine` must not ingest: the Claude Code hooks
  *  config (a large JSON blob that swamps the wake-up digest), the cursor, and
@@ -54,6 +55,7 @@ export interface MemoryStatus {
 }
 
 const MINE_INTERVAL_MS = 180_000; // re-mine changed memories every 3 min
+const MINE_TIMEOUT_MS = 10 * 60_000; // hard cap per mine (first run downloads the embedding model)
 
 export class MemoryManager {
   private binCache: string | null | undefined;
@@ -214,38 +216,78 @@ export class MemoryManager {
       });
       let err = '';
       proc.stderr?.on('data', (d) => { err += d.toString(); });
+      // Hard ceiling: a wedged mine used to hold its PID forever AND leave
+      // `mining` stuck true, silently stopping all future passes. Generous cap
+      // because the first run may lazily download the embedding model.
+      const timer = setTimeout(() => {
+        console.error(`[memory] mine ${id} timed out after ${MINE_TIMEOUT_MS / 60000}min — killing`);
+        try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        ensureKilled(proc.pid); // SIGKILL sweep if SIGTERM is ignored
+      }, MINE_TIMEOUT_MS);
+      timer.unref?.();
       proc.on('close', (code) => {
+        clearTimeout(timer);
         if (code !== 0) {
           console.error(`[memory] mine ${id} exited ${code}: ${err.slice(-300)}`);
           this.lastMined.delete(id); // let the next tick retry
         }
         resolve();
       });
-      proc.on('error', () => { this.lastMined.delete(id); resolve(); });
+      proc.on('error', () => { clearTimeout(timer); this.lastMined.delete(id); resolve(); });
     });
   }
 
   // — recall (read) —
 
+  /** Run one mempalace read command asynchronously. These used to be spawnSync
+   *  with a 120s timeout — on a cold model load that BLOCKED the Electron main
+   *  process (renderer IPC, timers, every window) for up to two minutes. Same
+   *  contract, but the event loop keeps breathing and a wedged CLI is swept. */
+  private runCli(args: string[], label: string): Promise<{ ok: boolean; output: string; error?: string }> {
+    return new Promise((resolve) => {
+      const bin = this.bin();
+      if (!this.active() || !bin) { resolve({ ok: false, output: '', error: 'semantic memory not active' }); return; }
+      let proc: ReturnType<typeof spawn>;
+      try {
+        proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) {
+        resolve({ ok: false, output: '', error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      let out = '', err = '';
+      let settled = false;
+      const settle = (r: { ok: boolean; output: string; error?: string }): void => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(r); }
+      };
+      proc.stdout?.setEncoding('utf8');
+      proc.stderr?.setEncoding('utf8');
+      proc.stdout?.on('data', (d: string) => { out += d; });
+      proc.stderr?.on('data', (d: string) => { err += d; });
+      const timer = setTimeout(() => {
+        try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        ensureKilled(proc.pid);
+        settle({ ok: false, output: out, error: `${label} timed out` });
+      }, 120_000);
+      timer.unref?.();
+      proc.on('close', (code) => {
+        if (code !== 0) settle({ ok: false, output: out, error: (err || `${label} failed`).trim() });
+        else settle({ ok: true, output: out });
+      });
+      proc.on('error', (e) => settle({ ok: false, output: '', error: e.message }));
+    });
+  }
+
   /** Semantic search across the shared palace. Returns the CLI's text output. */
-  search(query: string, opts: { wing?: string; results?: number } = {}): { ok: boolean; output: string; error?: string } {
-    const bin = this.bin();
-    if (!this.active() || !bin) return { ok: false, output: '', error: 'semantic memory not active' };
+  search(query: string, opts: { wing?: string; results?: number } = {}): Promise<{ ok: boolean; output: string; error?: string }> {
     const args = ['search', query, '--results', String(opts.results ?? 5)];
     if (opts.wing) args.push('--wing', opts.wing);
-    const res = spawnSync(bin, args, { env: this.childEnv(), encoding: 'utf8', timeout: 120_000, input: '' });
-    if (res.status !== 0) return { ok: false, output: res.stdout ?? '', error: (res.stderr || 'search failed').trim() };
-    return { ok: true, output: res.stdout ?? '' };
+    return this.runCli(args, 'search');
   }
 
   /** Session-start digest (~600-900 tokens). */
-  wakeUp(wing?: string): { ok: boolean; output: string; error?: string } {
-    const bin = this.bin();
-    if (!this.active() || !bin) return { ok: false, output: '', error: 'semantic memory not active' };
+  wakeUp(wing?: string): Promise<{ ok: boolean; output: string; error?: string }> {
     const args = ['wake-up'];
     if (wing) args.push('--wing', wing);
-    const res = spawnSync(bin, args, { env: this.childEnv(), encoding: 'utf8', timeout: 120_000, input: '' });
-    if (res.status !== 0) return { ok: false, output: res.stdout ?? '', error: (res.stderr || 'wake-up failed').trim() };
-    return { ok: true, output: res.stdout ?? '' };
+    return this.runCli(args, 'wake-up');
   }
 }

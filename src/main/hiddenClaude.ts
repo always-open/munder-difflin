@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { resolveCommand, userShellPath } from './shellEnv';
 import { projectDir } from './transcript';
+import { ensureKilled } from './procKill';
 
 /**
  * Shared helper: run a HIDDEN interactive claude session (ephemeral PTY) and
@@ -150,7 +151,14 @@ export function runHiddenClaude(prompt: string, opts: HiddenClaudeOptions): Prom
     let bootMaxTimer: NodeJS.Timeout;
     let globalTimer: NodeJS.Timeout;
 
-    const kill = () => { try { ptyProc.kill(); } catch { /* noop */ } };
+    // Hidden sessions are ephemeral CHECKS — nothing they spawn (MCP servers,
+    // helpers) may outlive them. Kill politely, then sweep the process group so
+    // every check releases its PIDs even if `claude` shrugs off the SIGHUP.
+    const kill = () => {
+      const pid = ptyProc.pid;
+      try { ptyProc.kill(); } catch { /* noop */ }
+      ensureKilled(pid);
+    };
 
     const finish = (r: HiddenClaudeResult) => {
       if (settled) return;
