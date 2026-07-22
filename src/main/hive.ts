@@ -19,7 +19,8 @@
  */
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
-  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync
+  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync,
+  openSync, readSync, closeSync, fstatSync
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
@@ -48,6 +49,11 @@ export type MessageAct = 'request' | 'inform' | 'propose' | 'query' | 'agree' | 
 
 export interface HiveMessage {
   id: string;
+  /** The id the SENDER wrote in its outbox file, when it wrote one. The wire
+   *  `id` above is always router-minted (an agent-supplied id can collide with
+   *  an undrained inbox file or sort before the drain cursor); the sender's own
+   *  id survives here so its `in_reply_to` threading still resolves. */
+  client_id?: string;
   conversation: string;
   in_reply_to: string | null;
   from: string;
@@ -177,6 +183,35 @@ export interface SpawnInjection {
 }
 
 const HOP_CAP = 12;
+
+/** Identity + signing flags for EVERY git invocation, sync or async — a hive
+ *  commit must never depend on the user's global git identity or gpg setup. */
+const GIT_ID_FLAGS = ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local'];
+
+/** Coalescing window for the async commit queue: git here is pure journaling
+ *  (every state file is durable on disk BEFORE a commit is requested), so all
+ *  mutations inside the window ride one commit. 2s keeps history near-live
+ *  while collapsing a routed-message burst into a single git run. */
+const COMMIT_DEBOUNCE_MS = 2000;
+
+/** An unparseable outbox file younger than this is treated as mid-write (agents
+ *  don't write atomically) and retried next sweep instead of quarantined. */
+const QUARANTINE_GRACE_MS = 2000;
+
+/** A disk-only task card created inside this window is NEVER dropped by a merge:
+ *  it can't have been in any writer's baseline (renderer arrays are at most one
+ *  ~5s poll stale), so its omission is staleness, not a delete. */
+const TASK_FRESH_MS = 15_000;
+
+/** logTail reads only this much from the end of the unbounded log.jsonl —
+ *  hundreds of ~120-byte lines, far more than any caller's `n`. */
+const LOG_TAIL_BYTES = 64 * 1024;
+
+/** One commit line for N coalesced mutation reasons. */
+function coalesceCommitMessage(msgs: string[]): string {
+  if (msgs.length <= 1) return msgs[0] ?? 'hive: update';
+  return `${msgs[0]} (+${msgs.length - 1} coalesced)`;
+}
 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
@@ -361,13 +396,36 @@ export class HiveManager {
     // so it tracks the bundled list).
     writeFileSync(join(root, 'COMMANDS.md'), COMMANDS_MD, 'utf8');
 
-    // Keep the churny/ephemeral live files out of the hive git repo.
+    // Keep the churny/ephemeral live files out of the hive git repo. The
+    // append-only ledgers and reflect backups especially: `git add -A` on every
+    // commit was re-blobbing an ~87MB cost-ledger.jsonl and stat-ing 10k tracked
+    // backup files — gigabytes of loose objects nothing ever reads back.
+    // `*.tmp-*` covers the atomic-write staging files so a racing `add -A`
+    // can't commit a torn temp.
     const gitignore = join(root, '.gitignore');
-    const want = ['fleet.json', 'hooks.sock', '.DS_Store'];
+    const want = ['fleet.json', 'hooks.sock', '.DS_Store', 'cost-ledger.jsonl', 'log.jsonl', 'backups/', '*.tmp-*'];
     let lines: string[] = [];
     if (existsSync(gitignore)) { try { lines = readFileSync(gitignore, 'utf8').split('\n'); } catch { lines = []; } }
     const missing = want.filter((w) => !lines.includes(w));
     if (missing.length) writeFileSync(gitignore, [...lines.filter(Boolean), ...missing].join('\n') + '\n', 'utf8');
+
+    // One-time (per process) migration for hives that committed the high-churn
+    // files before they were ignored: untrack them (--cached keeps the working
+    // files; --ignore-unmatch makes a clean repo a no-op) so history stops
+    // growing a fresh ledger blob per commit. Async + best-effort — bootstrap
+    // must never block on git; the staged deletions ride the next queued commit.
+    if (!this.churnUntracked && existsSync(join(root, '.git'))) {
+      this.churnUntracked = true;
+      void this.gitAsync(
+        ['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', 'cost-ledger.jsonl', 'log.jsonl', 'backups', 'fleet.json'],
+        root
+      ).then((res) => {
+        if (res.ok) this.commit('hive: stop tracking high-churn state files');
+        // The only retryable failure is losing the index.lock race to the commit
+        // queue — re-arm so a later bootstrap tries again.
+        else if (/index\.lock/i.test(res.err)) this.churnUntracked = false;
+      }).catch(() => { /* best-effort */ });
+    }
 
     // The hook shim: a dumb pipe between a `claude` hook and our UDS. Refreshed
     // on every bootstrap so it tracks code changes.
@@ -977,7 +1035,10 @@ export class HiveManager {
   /** Atomically deliver a message into a recipient agent's inbox. */
   private deliver(msg: HiveMessage, toId: string): void {
     const inbox = join(this.agentDir(toId), 'inbox');
-    if (!existsSync(inbox)) return; // unknown recipient — dropped (logged by caller)
+    // Backstop only: routeMessage bounces unknown recipients BEFORE calling
+    // this, so a missing inbox here is a registered agent whose dir was wiped
+    // out-of-band — nothing sane to do but skip.
+    if (!existsSync(inbox)) return;
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
   }
 
@@ -1016,7 +1077,35 @@ export class HiveManager {
           && canReceiveInbox(reg.agents[a]?.provider))
       // Never deliver to self — guards a god → "human" message looping back to god.
       : [resolveTo(msg.to)].filter((t) => t !== msg.from);
+    // Only targets that actually received SOMETHING (a delivery, a god-bounce,
+    // or a terminal handoff). An unknown-recipient bounce is excluded, so the
+    // log/floor/observer never claim a vanished message was routed.
+    const deliveredTargets: string[] = [];
     for (const t of targets) {
+      // Unknown recipient — a typo'd id, a display name instead of the wire id
+      // ("pam" vs "pam-x7k2p9"), or a never-registered target. deliver() would
+      // find no inbox and the mail would vanish while the log said routed — a
+      // requires_reply request then hangs forever on a false success record.
+      // Refuse it back to the sender naming the unknown recipient instead.
+      // Broadcast fan-out draws from the registry, so only direct addressing
+      // can land here.
+      if (!reg.agents[t] && !existsSync(join(this.agentDir(t), 'inbox'))) {
+        this.appendLog({ kind: 'bounced', reason: 'unknown-recipient', from: msg.from, to: t, act: msg.act, subject: msg.subject, id: msg.id });
+        this.deliver({
+          ...msg,
+          id: `${stamp()}-${shortRand()}`, // fresh wire id — never reuse the original's in another mailbox
+          in_reply_to: msg.id,
+          from: 'system',
+          to: msg.from,
+          act: 'refuse',
+          subject: `[undeliverable — unknown agent "${t}"] ${msg.subject}`,
+          body: `Your message to "${t}" was NOT delivered: no such agent exists in this hive. Wire ids are name-plus-suffix (e.g. "pam-x7k2p9") — check the roster in ${this.root() ?? ''}/registry.json and resend to a valid id.`,
+          hops: msg.hops + 1,
+          requires_reply: false,
+          needs_human: false
+        }, msg.from);
+        continue;
+      }
       // The send-only prep assistant must never be a delivery target: it doesn't
       // drain an inbox, so direct mail to it would rot unread (observed live: a
       // task brief plus the follow-up reprimand about the unread inbox, both
@@ -1028,6 +1117,7 @@ export class HiveManager {
           to: godId,
           subject: `[bounced — "${t}" is the send-only prep assistant; route work to a real agent] ${msg.subject}`
         }, godId);
+        deliveredTargets.push(t);
         continue;
       }
       // A provider that can't drain its own inbox (a hookless custom command)
@@ -1045,6 +1135,7 @@ export class HiveManager {
             subject: `[undeliverable — "${t}" runs ${reg.agents[t]?.provider ?? 'a hookless CLI'} and the terminal handoff failed (renderer unavailable); relay this to it] ${msg.subject}`
           }, godId);
         }
+        deliveredTargets.push(t);
         continue;
       }
       // 1d — proxy-tier providers (qwen) CAN receive inbox, but only via a
@@ -1061,15 +1152,22 @@ export class HiveManager {
             subject: `[undeliverable — "${t}" runs ${reg.agents[t]?.provider ?? 'a proxy-tier CLI'} and the terminal handoff failed (renderer unavailable); relay this to it] ${msg.subject}`
           }, godId);
         }
+        deliveredTargets.push(t);
         continue;
       }
       this.deliver(msg, t);
+      deliveredTargets.push(t);
     }
-    this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id });
-    this.emitMessage(msg, targets);
+    // A message whose EVERY target bounced as unknown must not leave a 'message'
+    // (= routed) record — the 'bounced' lines above are the truth. Target-less
+    // sends (self-send filtered out) keep their historical log line.
+    if (targets.length === 0 || deliveredTargets.length > 0) {
+      this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id });
+    }
+    this.emitMessage(msg, deliveredTargets);
     // Main-process observer (e.g. the closing-time controller watching for the
     // team's ACKs and the god's COMPLETE). Best-effort, never breaks routing.
-    try { this.routedObserver?.(msg, targets); } catch { /* observer error */ }
+    try { this.routedObserver?.(msg, deliveredTargets); } catch { /* observer error */ }
   }
 
   /** Observer invoked for EVERY routed message with its resolved targets.
@@ -1131,6 +1229,11 @@ export class HiveManager {
   }
   stopRouter(): void {
     if (this.routerTimer) { clearInterval(this.routerTimer); this.routerTimer = null; }
+    // Every stopRouter caller is a teardown boundary — quit, home MOVE (which
+    // copies hive/.git and must not race a live git child), reset, and the
+    // sleep-wake re-arm. A queued/debounced commit must not outlive any of
+    // them, so flush synchronously here; no-op when nothing is pending.
+    try { this.flushSync(); } catch { /* best-effort at teardown */ }
   }
 
   routeOnce(): number {
@@ -1139,22 +1242,68 @@ export class HiveManager {
     const agentsDir = join(root, 'agents');
     if (!existsSync(agentsDir)) return 0;
     let routed = 0;
+    const now = Date.now();
     for (const id of readdirSync(agentsDir)) {
       const outbox = join(agentsDir, id, 'outbox');
       if (!existsSync(outbox)) continue;
+      const sent = join(outbox, '.sent');
+      // git cannot represent an empty dir, so a hive restored from clone/checkout
+      // loses any agent's empty .sent — and then EVERY archive rename below throws
+      // forever. Recreate per sweep: cheap, idempotent.
+      try { mkdirSync(sent, { recursive: true }); } catch { /* best-effort */ }
       for (const f of readdirSync(outbox)) {
         if (!f.endsWith('.json')) continue;
         const full = join(outbox, f);
+        let msg: HiveMessage;
         try {
           const partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
-          const msg = this.normalize(partial, id);
+          // The ROUTER mints the wire id: an agent-supplied id (template-copied
+          // outbox files keep the old one) can collide with an undrained inbox
+          // file — renameSync overwrites silently — or sort before the
+          // recipient's drain cursor so the message never surfaces on Stop. The
+          // sender's own id is preserved as client_id for its threading.
+          const clientId = typeof partial.id === 'string' && partial.id ? partial.id : undefined;
+          delete partial.id;
+          msg = this.normalize(partial, id);
+          if (clientId) msg.client_id = clientId;
           msg.from = id; // sender is authoritative — the owning directory
-          this.routeMessage(msg);
-          renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
-          routed++;
         } catch {
-          // malformed file — quarantine so we don't spin on it
-          try { renameSync(full, join(outbox, '.sent', `bad-${f}`)); } catch { /* noop */ }
+          // Unparseable. Agents write outbox files non-atomically, so a poll can
+          // land mid-write and read truncated JSON — anything younger than the
+          // grace window gets the next tick instead of the quarantine.
+          try { if (now - statSync(full).mtimeMs < QUARANTINE_GRACE_MS) continue; } catch { continue; /* raced a delete */ }
+          // Genuinely malformed — quarantine so we don't spin, and SAY SO: this
+          // was silent one-way loss on the primary coordination rail. Stamped
+          // name so repeated quarantines of a reused filename never clobber.
+          try {
+            renameSync(full, join(sent, `bad-${stamp()}-${f}`));
+            this.appendLog({ kind: 'quarantine', agentId: id, file: f, reason: 'malformed-json' });
+            console.error(`[hive] quarantined malformed outbox file ${id}/${f}`);
+          } catch { /* rename failed — retried next sweep */ }
+          continue;
+        }
+        // CLAIM (archive) BEFORE delivering. Deliver-then-rename meant a failing
+        // rename redelivered the same message with a fresh id every 1.5s tick,
+        // forever. Claim-first inverts the failure: an unclaimable file is simply
+        // retried next sweep with nothing delivered — no duplicates either way.
+        // The wire id in the archive name keeps a reused msg.json from clobbering
+        // .sent history (recentMessages reads it).
+        const claimed = join(sent, `${msg.id}-${f}`);
+        try {
+          renameSync(full, claimed);
+        } catch (e) {
+          console.error(`[hive] cannot archive ${id}/${f} — delivery deferred to next sweep:`, e);
+          continue;
+        }
+        try {
+          this.routeMessage(msg);
+          routed++;
+        } catch (e) {
+          // Claimed but undelivered: the message text is preserved at the claimed
+          // path. Log loudly instead of looping — un-claiming would rebuild the
+          // redelivery storm this ordering exists to kill.
+          this.appendLog({ kind: 'route-error', agentId: id, id: msg.id, file: f, error: String(e) });
+          console.error(`[hive] routeMessage failed for ${id}/${f} (preserved at ${claimed}):`, e);
         }
       }
     }
@@ -1173,20 +1322,61 @@ export class HiveManager {
     const root = this.root();
     return root && existsSync(join(root, 'board.md')) ? readFileSync(join(root, 'board.md'), 'utf8') : '';
   }
+  /** Card ids ever returned by tasks() in THIS process — the proof some caller
+   *  could have seen a card and therefore could MEAN its omission as a delete.
+   *  writeTasks only honors a delete for served ids; a never-served disk-only
+   *  card (god/webhook wrote it between renderer polls) is always kept. Restart
+   *  is safe: the kanban dismiss re-reads the raw ledger immediately before
+   *  writing, which repopulates this set ahead of its delete. */
+  private servedTaskIds = new Set<string>();
+
   tasks(): unknown {
     const root = this.root();
-    return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
+    if (!root) return { tasks: [] };
+    const data = this.readJson<{ tasks?: unknown[] }>(join(root, 'tasks.json'), { tasks: [] });
+    try {
+      for (const t of data.tasks ?? []) {
+        const id = (t as { id?: unknown } | null)?.id;
+        if (typeof id === 'string') this.servedTaskIds.add(id);
+      }
+    } catch { /* tracking is best-effort — never break a read */ }
+    return data;
   }
 
-  /** Persist the task ledger to hive/tasks.json and commit it. Mirrors the
-   *  board/message persist pattern: write JSON, log the change, single-commit. */
+  /** Persist the task ledger to hive/tasks.json and commit it.
+   *
+   *  READ-MODIFY-WRITE, not whole-file replace: three unsynchronized writers
+   *  share this file — renderer arrays up to one ~5s poll stale, the webhook
+   *  RMW, and the god editing tasks.json directly from its shell. A stale
+   *  whole-array overwrite silently reverted god's concurrent cards (dropping
+   *  a done card's `result` kills the one-shot Slack reply). Merge rules:
+   *    - a card the caller carries wins by id (its edit is the intent);
+   *    - a disk-only card is KEPT unless the caller demonstrably deleted it:
+   *      served to a reader this process AND older than TASK_FRESH_MS (a card
+   *      created moments ago can't have been in any caller's baseline). This
+   *      preserves the kanban's dismiss flow (it fresh-reads, filters one id,
+   *      writes back) without letting staleness delete god's new cards. */
   writeTasks(tasks: HiveTask[]): void {
     const root = this.root();
     if (!root) return;
     this.ensureHive();
-    this.writeJson(join(root, 'tasks.json'), { tasks });
-    this.appendLog({ kind: 'tasks', count: tasks.length });
-    this.commit(`hive: tasks (${tasks.length})`);
+    const disk = this.readJson<{ tasks?: HiveTask[] }>(join(root, 'tasks.json'), { tasks: [] });
+    const incoming = new Map(
+      (Array.isArray(tasks) ? tasks : []).filter((t) => t && typeof t.id === 'string').map((t) => [t.id, t])
+    );
+    const merged: HiveTask[] = [...incoming.values()];
+    const now = Date.now();
+    for (const d of disk.tasks ?? []) {
+      if (!d || typeof d.id !== 'string' || incoming.has(d.id)) continue;
+      const createdMs = Date.parse(d.createdAt ?? '');
+      // Unparseable createdAt degrades to "fresh" — resurrecting a dismissed
+      // malformed card is an annoyance; deleting god's concurrent card is loss.
+      const fresh = !isFinite(createdMs) || now - createdMs < TASK_FRESH_MS;
+      if (!(this.servedTaskIds.has(d.id) && !fresh)) merged.push(d);
+    }
+    this.writeJson(join(root, 'tasks.json'), { tasks: merged });
+    this.appendLog({ kind: 'tasks', count: merged.length });
+    this.commit(`hive: tasks (${merged.length})`);
   }
   memory(id: string): string {
     const p = join(this.agentDir(id), 'memory.md');
@@ -1496,17 +1686,37 @@ export class HiveManager {
   }
 
   /** Write the live fleet snapshot Michael reads (`fleet.json`, gitignored).
-   *  Best-effort — called from a timer, must never throw. */
+   *  Best-effort — called from a timer, must never throw. Atomic (tmp+rename):
+   *  the god agent is a SEPARATE process polling this file every heartbeat, and
+   *  a raw O_TRUNC write hands it an empty/partial JSON in the write window. */
   writeFleetSnapshot(snapshot: unknown): void {
     const root = this.root();
     if (!root) return;
-    try { writeFileSync(join(root, 'fleet.json'), JSON.stringify(snapshot, null, 2), 'utf8'); } catch { /* noop */ }
+    try { this.atomicWriteJson(join(root, 'fleet.json'), snapshot); } catch { /* noop */ }
   }
   logTail(n = 200): unknown[] {
     const root = this.root();
-    if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const lines = readFileSync(join(root, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
-    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+    const p = join(root ?? '', 'log.jsonl');
+    if (!root || !existsSync(p)) return [];
+    // Tail-read (same pattern as transcript.ts readContextTokens): log.jsonl is
+    // append-only with no rotation, and the Activity tab polls this every 3s —
+    // a whole-file read+split costs MBs per tick and grows with hive age. The
+    // last LOG_TAIL_BYTES hold far more lines than any caller's n.
+    try {
+      const fd = openSync(p, 'r');
+      try {
+        const size = fstatSync(fd).size;
+        const len = Math.min(size, LOG_TAIL_BYTES);
+        if (len === 0) return [];
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        let text = buf.toString('utf8');
+        // A mid-file start almost certainly cut a line — drop the partial head.
+        if (size > len) text = text.slice(text.indexOf('\n') + 1);
+        const lines = text.trim().split('\n').filter(Boolean);
+        return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+      } finally { closeSync(fd); }
+    } catch { return []; }
   }
 
   private listMessages(dir: string): HiveMessage[] {
@@ -1566,8 +1776,15 @@ export class HiveManager {
   private readJson<T>(p: string, fallback: T): T {
     try { return JSON.parse(readFileSync(p, 'utf8')) as T; } catch { return fallback; }
   }
+  /** ALL JSON state writes are atomic. registry.json / cursor.json / tasks.json
+   *  are read by other processes (god polls the roster; agents read cursors) and
+   *  a plain writeFileSync opens O_TRUNC — a reader in the truncate→write window
+   *  sees torn JSON, which readJson silently degrades to its fallback (= roster
+   *  wiped, resume keys lost, cursor reset → double delivery). Same-dir
+   *  tmp+rename closes the window; `*.tmp-*` is gitignored so a racing
+   *  `add -A` can't commit the staging file. */
   private writeJson(p: string, data: unknown): void {
-    writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
+    this.atomicWriteJson(p, data);
   }
   private atomicWriteJson(p: string, data: unknown): void {
     const tmp = `${p}.tmp-${shortRand()}`;
@@ -1575,18 +1792,122 @@ export class HiveManager {
     renameSync(tmp, p);
   }
 
-  // — git (single committer, retry + stale-lock recovery) —
+  // — git (single committer: serialized async queue, sync flush at teardown) —
+
+  /** SYNC git — reserved for the two places blocking is the point: repo init in
+   *  ensureHive (once, empty repo, milliseconds) and flushSync (teardown). All
+   *  hot-path commits go through the async queue below. */
   private git(args: string[], cwd: string): { ok: boolean; out: string; err: string } {
-    const res = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local', ...args], {
+    const res = spawnSync('git', [...GIT_ID_FLAGS, ...args], {
       cwd, encoding: 'utf8', timeout: 8000
     });
     return { ok: res.status === 0, out: res.stdout ?? '', err: res.stderr ?? '' };
   }
 
-  /** Commit all hive changes. No-op if there is nothing staged. */
+  /** ASYNC git child. Same 8s kill-ceiling as the sync path so a hung git can't
+   *  leak; serialized by runCommitQueue so at most one queue child runs. */
+  private gitAsync(args: string[], cwd: string): Promise<{ ok: boolean; out: string; err: string }> {
+    return new Promise((resolve) => {
+      let out = '', err = '', settled = false;
+      const settle = (ok: boolean): void => { if (!settled) { settled = true; resolve({ ok, out, err }); } };
+      let child: ChildProcess;
+      try {
+        child = spawn('git', [...GIT_ID_FLAGS, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) { err = String(e); settle(false); return; }
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', (d: string) => { out += d; });
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', (d: string) => { err += d; });
+      const killer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } }, 8000);
+      killer.unref?.();
+      child.on('error', () => { clearTimeout(killer); settle(false); });
+      child.on('close', (code) => { clearTimeout(killer); settle(code === 0); });
+    });
+  }
+
+  private commitTimer: NodeJS.Timeout | null = null;
+  /** Mutation reasons queued since the last commit ran — coalesced into one. */
+  private pendingCommits: string[] = [];
+  private commitRunning = false;
+  /** Bumped by flushSync so an interrupted async chain abandons itself instead
+   *  of spawning git against a root that is being torn down or copied. */
+  private commitEpoch = 0;
+  /** One-shot guard for the ensureHive churn-file untrack migration. */
+  private churnUntracked = false;
+
+  /** Queue a hive commit. Git here is pure JOURNALING — every state file is
+   *  already durable on disk before this is called — so requests coalesce into
+   *  one debounced async commit and nothing durable is ever lost by waiting.
+   *  The old per-mutation spawnSync blocked the Electron main thread ≥1s per
+   *  call (`add -A` over an 87MB tracked ledger), stalling IPC, PTY pumping and
+   *  the hook replies that gate every agent's tool calls, ~140x/day. */
   commit(message: string): void {
     const root = this.root();
     if (!root || !existsSync(join(root, '.git'))) return;
+    this.pendingCommits.push(message);
+    if (this.commitTimer) return; // window already armed — this request rides it
+    this.commitTimer = setTimeout(() => {
+      this.commitTimer = null;
+      void this.runCommitQueue();
+    }, COMMIT_DEBOUNCE_MS);
+    // Never hold the process open for a journaling commit (tests, quit) —
+    // teardown flushes synchronously via stopRouter → flushSync.
+    this.commitTimer.unref?.();
+  }
+
+  /** Drain the pending-commit queue: one `add -A` + commit per coalesced batch,
+   *  never two git children at once (single-committer invariant). Retries the
+   *  index.lock race with async backoff; a non-lock failure is LOGGED and
+   *  dropped — the next mutation's commit sweeps its changes in via add -A. */
+  private async runCommitQueue(): Promise<void> {
+    if (this.commitRunning) return; // live chain re-checks the queue when done
+    const root = this.root();
+    if (!root || !existsSync(join(root, '.git'))) { this.pendingCommits = []; return; }
+    this.commitRunning = true;
+    const epoch = this.commitEpoch;
+    try {
+      while (this.pendingCommits.length) {
+        const message = coalesceCommitMessage(this.pendingCommits.splice(0));
+        for (let attempt = 0; attempt < 5; attempt++) {
+          this.clearStaleLock(root);
+          const add = await this.gitAsync(['add', '-A'], root);
+          if (epoch !== this.commitEpoch) return; // flushSync took over mid-chain
+          const commit = await this.gitAsync(['commit', '-q', '-m', message], root);
+          if (epoch !== this.commitEpoch) return;
+          if (commit.ok) break;
+          if (/nothing to commit/i.test(commit.out + commit.err)) break;
+          if (!add.ok || /index\.lock/i.test(commit.err)) {
+            await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+            if (epoch !== this.commitEpoch) return;
+            continue;
+          }
+          console.error(`[hive] commit failed (${message}): ${(commit.err || add.err).trim()}`);
+          break;
+        }
+      }
+    } finally {
+      this.commitRunning = false;
+    }
+  }
+
+  /** One last SYNCHRONOUS commit — teardown only (quit / home-move / reset all
+   *  reach here via stopRouter). Blocking is acceptable exactly here: the event
+   *  loop is about to stop (a pending timer would never fire) or hive/.git is
+   *  about to be copied (an in-flight async child would corrupt the copy).
+   *  Bumps the epoch so the async chain abandons itself; if its git child is
+   *  mid-write it holds index.lock, and the sync retry loop below waits that
+   *  out — the child is a live OS process and finishes even while this thread
+   *  is blocked. No-op when nothing is queued or in flight. */
+  flushSync(): void {
+    if (this.commitTimer) { clearTimeout(this.commitTimer); this.commitTimer = null; }
+    this.commitEpoch++;
+    const hadInflight = this.commitRunning;
+    this.commitRunning = false;
+    const msgs = this.pendingCommits.splice(0);
+    const root = this.root();
+    if (!root || !existsSync(join(root, '.git'))) return;
+    if (!msgs.length && !hadInflight) return;
+    const message = coalesceCommitMessage(msgs.length ? msgs : ['hive: flush']);
     for (let attempt = 0; attempt < 5; attempt++) {
       this.clearStaleLock(root);
       const add = this.git(['add', '-A'], root);
@@ -1594,7 +1915,7 @@ export class HiveManager {
       if (commit.ok) return;
       if (/nothing to commit/i.test(commit.out + commit.err)) return;
       if (!add.ok || /index\.lock/i.test(commit.err)) { sleepSync(50 * (attempt + 1)); continue; }
-      return; // a non-lock failure — give up quietly, the next mutation retries
+      return; // non-lock failure — nothing more a teardown can do
     }
   }
 
