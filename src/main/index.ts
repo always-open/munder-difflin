@@ -242,7 +242,12 @@ const preservedWorktrees = new Map<string, PreservedWorktree>();
  * error can never crash the caller (an IPC handler or node-pty's onExit).
  */
 function teardownPty(id: string): void {
-  // 0) Revoke this id's broker capability (if any). Idempotent + harmless for a
+  // 0) Drop any pending install-relaunch armed for this id. PTY ids are reused
+  //    across kill()+respawn (model change, revive, restore), so a stale entry
+  //    left by an explicitly-killed installer tab would fire a GHOST respawn —
+  //    with the original spawn opts — on a later clean exit under the same id.
+  pendingInstallRelaunch.delete(id);
+  //    Revoke this id's broker capability (if any). Idempotent + harmless for a
   //    non-worker PTY; ensures a dead worker's token can never reach an integration.
   try { integrationBroker.revoke(id); } catch { /* best-effort */ }
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
@@ -251,6 +256,10 @@ function teardownPty(id: string): void {
     ptyToAgent.delete(id);
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
+    // Evict the dead agent's telemetry accumulators (sessions + span ring).
+    // Without this the collector's maps grow one entry per churned worker for
+    // the app's whole run, and every 8s fleet snapshot re-copies dead spans.
+    try { telemetry.evictAgent(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
     // PTY never leaves an orphan loopback listener. No-op for non-proxy agents.
     try { hive.stopProxyBridge(agentId); } catch (e) { console.error('[hive] stopProxyBridge failed:', e); }
@@ -281,6 +290,7 @@ function teardownPty(id: string): void {
   // A worker whose isolation failed (non-repo cwd) has no worktree to gate above —
   // still clear its tracking entry so the controller stops watching a dead PTY.
   if (liveWorkers.has(id)) liveWorkers.delete(id);
+  scannedOutboxFiles.delete(id); // done-scan memo dies with the worker
   syncKeepAwake();
 }
 
@@ -752,7 +762,20 @@ function runBreakerBeat(progressWindowMs: number): void {
     // "is there a live session" without changing any live-agent behavior.
     if (sample?.sessionId) hive.appendCostLedger(sample); // ledger covers everyone incl. god
     if (id === reg.godId) continue;            // breaker skips god
-    inputs.push({ agentId: id, sample, progressing: now - lastCoordinationAt(id) < progressWindowMs });
+    // Progress = fresh coordination files OR a recent OTel tool span. The span
+    // leg closes the background-work blind spot: subagent/Workflow tool calls
+    // never reach the parent session's PostToolUse hook (so the breaker's own
+    // distinct-tool clock stays stale) but their spans DO flow through the
+    // collector under this agent's id — an idle parent supervising a hard-
+    // working background fleet is progressing, not wedged. Observed live: the
+    // one residual no-progress false positive after the #109 fixes.
+    const spans = telemetry.getSpans(id);
+    const lastSpanAt = spans.length ? spans[spans.length - 1].ts : 0;
+    inputs.push({
+      agentId: id,
+      sample,
+      progressing: now - lastCoordinationAt(id) < progressWindowMs || now - lastSpanAt < progressWindowMs
+    });
   }
   for (const d of breaker.tick(inputs, now)) {
     try { liveWebContents()?.send('control:breakerState', d.state); } catch { /* window gone */ }
@@ -1022,10 +1045,18 @@ function downloadSlackFile(
           if (aborted) return;
           stream.end(() => resolve({ path: destPath, name, mimetype }));
         });
-        res.on('error', () => { stream.destroy(); resolve(null); });
-        stream.on('error', () => { res.destroy(); resolve(null); });
+        // Error/stall paths must also unlink the partial file — Slack got its
+        // 200 before this download, so nothing retries; a half-written file
+        // would sit in slack-files/ forever.
+        res.on('error', () => { stream.destroy(); try { unlinkSync(destPath); } catch { /* gone */ } resolve(null); });
+        stream.on('error', () => { res.destroy(); try { unlinkSync(destPath); } catch { /* gone */ } resolve(null); });
       }
     );
+    // A stalled (alive-but-idle) connection would otherwise hold this promise —
+    // and with it the WHOLE inbound Slack message, which awaits the download —
+    // until app quit. 30s of socket silence aborts; onMessage then forwards the
+    // message with a partial/empty file list instead of never delivering it.
+    req.setTimeout(30_000, () => req.destroy(new Error('slack file download timed out')));
     req.on('error', () => resolve(null));
     req.end();
   });
@@ -2280,6 +2311,9 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   // (Identical recovery path to resetAll — relaunch is the clean re-bind.)
   allowQuit = true;
   writeConfig({ harnessHome: newHome });
+  // killAll suppresses per-PTY teardown (the only other stopProxyBridge caller),
+  // so without this the proxy sidecars survive the relaunch as orphans.
+  try { hive.stopAllProxyBridges(); } catch (e) { console.error('[changeHome] stopAllProxyBridges:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[changeHome] killAll:', e); }
   app.relaunch();
   app.exit(0);
@@ -2489,17 +2523,27 @@ function teardownAndQuit(): void {
   // Each teardown step is best-effort: a throw here (e.g. a dying child or a
   // half-torn-down socket) must never abort the quit or pop a crash dialog.
   try { clearMissionTimers(); } catch (e) { console.error('[quit] clearMissionTimers:', e); }
+  // app.quit() is graceful — the loop keeps turning while windows close, so a
+  // 30s breaker tick landing in that window would see killed agents as live
+  // (killAll suppresses per-PTY teardown) and git-commit stale steer mail into
+  // the hive for the NEXT launch to read. Stop the beats + straggler timers.
+  try { stopAlwaysOnBeats(); } catch (e) { console.error('[quit] stopAlwaysOnBeats:', e); }
+  try { if (resumeHealthTimer) { clearTimeout(resumeHealthTimer); resumeHealthTimer = null; } } catch { /* noop */ }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
+  try { stopWebhookServer(); } catch (e) { console.error('[quit] webhook.stop:', e); }
   try { memory.stop(); } catch (e) { console.error('[quit] memory.stop:', e); }
   try { reflector.stop(); } catch (e) { console.error('[quit] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[quit] persist.close:', e); }
   try { hive.stopAllProxyBridges(); } catch (e) { console.error('[quit] stopAllProxyBridges:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[quit] killAll:', e); }
+  // killAll never runs per-PTY teardown — clear the agent map so any callback
+  // that still fires mid-quit sees no live agents instead of steering ghosts.
+  try { ptyToAgent.clear(); } catch { /* noop */ }
   app.quit();
 }
 ipcMain.handle('app:confirmClose', () => {
@@ -2546,15 +2590,22 @@ ipcMain.handle('app:resetAll', () => {
   allowQuit = true;
   // Tear everything down first so nothing writes back into the dirs we wipe.
   try { clearMissionTimers(); } catch (e) { console.error('[reset] clearMissionTimers:', e); }
+  try { stopAlwaysOnBeats(); } catch (e) { console.error('[reset] stopAlwaysOnBeats:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[reset] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[reset] slack.stop:', e); }
+  try { stopWebhookServer(); } catch (e) { console.error('[reset] webhook.stop:', e); }
   try { memory.stop(); } catch (e) { console.error('[reset] memory.stop:', e); }
   try { reflector.stop(); } catch (e) { console.error('[reset] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[reset] persist.close:', e); }
+  // Sidecars BEFORE killAll: killAll nulls the exit handler, so per-PTY teardown
+  // (the only other stopProxyBridge caller) never runs on this path — without
+  // this line every qwen/crush proxy child survives as an orphan while the hive
+  // dir is rmSync'd out from under it.
+  try { hive.stopAllProxyBridges(); } catch (e) { console.error('[reset] stopAllProxyBridges:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[reset] killAll:', e); }
   // Erase the hive (Michael's + every agent's memory, inboxes, tasks, board,
   // git history) and the semantic-memory palace. Only these harness-created
@@ -3053,26 +3104,36 @@ function archiveRequest(filePath: string, sub: '.done' | '.failed'): void {
  *  own timestamp), falling back to the file's mtime when `created_at` is missing
  *  or unparseable. When neither yields a usable timestamp we DON'T count it
  *  (fail toward keeping the worker alive — the idle reaper is the backstop). */
+/** Basenames already scanned-and-rejected per worker, so the 1.5s tick doesn't
+ *  re-read + re-parse the worker's whole outbox history every beat (messages
+ *  are immutable and the .sent rename preserves basenames — a rejected file can
+ *  never become a `done` later). Entries die with the worker's liveWorkers
+ *  record; the map is pruned alongside it in teardownPty via liveWorkers. */
+const scannedOutboxFiles = new Map<string, Set<string>>();
+
 function workerSignaledDone(workerId: string, spawnedAt: number): boolean {
   const root = hive.root();
   if (!root) return false;
+  let seen = scannedOutboxFiles.get(workerId);
+  if (!seen) { seen = new Set(); scannedOutboxFiles.set(workerId, seen); }
   const base = join(root, 'agents', workerId, 'outbox');
   for (const dir of [base, join(base, '.sent')]) {
     if (!existsSync(dir)) continue;
     let files: string[];
     try { files = readdirSync(dir); } catch { continue; }
     for (const f of files) {
-      if (!f.endsWith('.json')) continue;
+      if (!f.endsWith('.json') || seen.has(f)) continue;
       const fp = join(dir, f);
       try {
         const msg = JSON.parse(readFileSync(fp, 'utf8')) as { act?: string; created_at?: string };
-        if (msg.act !== 'done') continue;
+        if (msg.act !== 'done') { seen.add(f); continue; }
         let ts = Date.parse(msg.created_at ?? '');
         if (!Number.isFinite(ts)) {
           try { ts = statSync(fp).mtimeMs; } catch { ts = NaN; }
         }
         if (Number.isFinite(ts) && ts > spawnedAt) return true;
-      } catch { /* skip unreadable/partial */ }
+        seen.add(f); // stale done from a reused reqId — never counts for THIS worker
+      } catch { /* skip unreadable/partial — retry next tick, don't memoize */ }
     }
   }
   return false;
@@ -3251,8 +3312,13 @@ async function ephemeralWorkerTick(): Promise<void> {
     const defaultTokenCap = typeof cfg.defaultWorkerTokenCap === 'number' && cfg.defaultWorkerTokenCap > 0
       ? cfg.defaultWorkerTokenCap : 0;
 
-    // (1) Finish or reap. ptyManager.kill → teardownPty → gated worktree + archive
-    //     + liveWorkers.delete. `releasing` guards the gap before onExit fires.
+    // (1) Finish or reap. An EXPLICIT ptyManager.kill() never fires onExit's
+    //     teardown (the session is deleted first, so the stale-exit guard eats
+    //     it) — every release path here must call teardownPty itself, exactly
+    //     like the pty:kill IPC / voice-kill / breaker-stop callers do. Without
+    //     it the worker stays in liveWorkers forever (releasing:true), which
+    //     permanently burns a concurrency slot per completion and skips the
+    //     worktree/archive/broker/breaker cleanup. teardownPty is idempotent.
     for (const [workerId, rec] of [...liveWorkers]) {
       if (rec.releasing) continue;
       if (workerSignaledDone(workerId, rec.spawnedAt)) {
@@ -3260,6 +3326,7 @@ async function ephemeralWorkerTick(): Promise<void> {
         rec.releasing = true;
         console.log(`[worker] ${workerId} signaled done — releasing`);
         ptyManager.kill(workerId);
+        teardownPty(workerId);
         continue;
       }
       // Token-cap reap (default-off plumbing). An effective cap > 0 → reap when the
@@ -3276,6 +3343,7 @@ async function ephemeralWorkerTick(): Promise<void> {
             rec.slack
           );
           ptyManager.kill(workerId);
+          teardownPty(workerId);
           continue;
         }
       }
@@ -3290,6 +3358,7 @@ async function ephemeralWorkerTick(): Promise<void> {
           rec.slack
         );
         ptyManager.kill(workerId);
+        teardownPty(workerId);
       }
     }
 
@@ -3394,6 +3463,7 @@ ipcMain.handle('workers:stop', (_evt, workerId: string): { ok: boolean; error?: 
   rec.releasing = true;
   console.log(`[worker] manual stop requested for ${workerId}`);
   try { ptyManager.kill(workerId); } catch (e) { return { ok: false, error: String(e) }; }
+  teardownPty(workerId); // explicit kill never reaches onExit's teardown — run it here
   return { ok: true };
 });
 
@@ -3440,6 +3510,14 @@ function armAlwaysOnBeats(): void {
   fleetTimer = setInterval(writeFleetSnapshot, 8_000);
   if (breakerBeatTimer) clearInterval(breakerBeatTimer);
   breakerBeatTimer = setInterval(() => { try { runBreakerBeat(300_000); } catch (e) { console.error('[breaker beat]', e); } }, 30_000);
+}
+
+/** Inverse of armAlwaysOnBeats — for the quit/reset paths. A beat that fires
+ *  mid-quit sees half-torn-down state (killed PTYs still in ptyToAgent) and can
+ *  write stale breaker mail / ledger rows into the durable hive. */
+function stopAlwaysOnBeats(): void {
+  if (fleetTimer) { clearInterval(fleetTimer); fleetTimer = null; }
+  if (breakerBeatTimer) { clearInterval(breakerBeatTimer); breakerBeatTimer = null; }
 }
 
 /** Wall-clock instant we last observed the machine suspend or lock, so a resume
@@ -3594,6 +3672,11 @@ app.on('before-quit', (e) => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    // Defense-in-depth: normally the per-window close handler routed through
+    // teardownAndQuit already, but if this fires with live proxy sidecars they
+    // must not orphan — killAll suppresses the per-PTY teardown that would
+    // otherwise stop them.
+    try { hive.stopAllProxyBridges(); } catch { /* best-effort */ }
     ptyManager.killAll();
     app.quit();
   }

@@ -1,5 +1,9 @@
 import { spawn } from 'node:child_process';
 
+/** Hard cap per `gh` invocation — generous for a healthy API round-trip, short
+ *  enough that a wedged network can't pin a spinner or leak the child. */
+const GH_TIMEOUT_MS = 10_000;
+
 /** A GitHub issue, normalized for the renderer (labels/assignees flattened to names). */
 export interface GHIssue {
   number: number;
@@ -37,10 +41,19 @@ export function listIssues(cwd: string): Promise<{ ok: boolean; issues?: GHIssue
     );
     let stdout = '';
     let stderr = '';
+    // `gh` talks to api.github.com with no response deadline of its own — a
+    // stalled connection would leak the child and pin the caller's spinner.
+    // Mirror runGit's SIGKILL timer (git.ts).
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, GH_TIMEOUT_MS);
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('error', (e) => resolve({ ok: false, error: e.message }));
-    proc.on('close', (code) => {
+    proc.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: e.message }); });
+    proc.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (signal === 'SIGKILL') {
+        resolve({ ok: false, error: `gh timed out after ${GH_TIMEOUT_MS / 1000}s` });
+        return;
+      }
       if (code !== 0) {
         resolve({ ok: false, error: stderr.trim() || `gh exited ${code}` });
         return;
@@ -97,10 +110,17 @@ export function listCIRuns(cwd: string): Promise<{ ok: boolean; runs?: CIRun[]; 
     );
     let stdout = '';
     let stderr = '';
+    // Same network-stall guard as listIssues above.
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, GH_TIMEOUT_MS);
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('error', (e) => resolve({ ok: false, error: e.message }));
-    proc.on('close', (code) => {
+    proc.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: e.message }); });
+    proc.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (signal === 'SIGKILL') {
+        resolve({ ok: false, error: `gh timed out after ${GH_TIMEOUT_MS / 1000}s` });
+        return;
+      }
       if (code !== 0) {
         resolve({ ok: false, error: stderr.trim() || `gh exited ${code}` });
         return;

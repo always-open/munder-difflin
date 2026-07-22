@@ -29,6 +29,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+import { getTunnel } from './tunnelCache';
 // NOTE: `tunnelmole` is an ESM-only package. The Electron main process is bundled
 // as CommonJS, so a static `import` gets externalized into `require('tunnelmole')`
 // and throws ERR_REQUIRE_ESM at load. It is imported dynamically inside
@@ -99,10 +100,11 @@ export class WebhookServer {
   }
 
   /**
-   * Bind the local HTTP server, then open a public tunnel to it. The HTTP handler
-   * (the security boundary) is live the instant `listen` resolves; the tunnel is
-   * opened afterwards and is non-fatal — if it can't be established the server
-   * keeps running and we report the tunnel error without a URL.
+   * Bind the local HTTP server, then open a public tunnel to it. INVARIANT the
+   * callers rely on: `ok:false` means NOTHING is left bound — a tunnel failure
+   * stops the just-bound listener before returning, otherwise the caller nulls
+   * its reference and the live server becomes an unreachable orphan holding the
+   * port (EADDRINUSE on every later start) until process exit.
    */
   async start(): Promise<{ ok: boolean; url?: string; error?: string }> {
     if (this.server) return { ok: false, error: 'already running' };
@@ -115,18 +117,19 @@ export class WebhookServer {
     }
     try {
       const url = await this.openTunnel();
-      if (!url) throw new Error('tunnelmole returned empty URL');
       this.tunnelUrl = url;
-      // tunnelmole runs in the background; there is no close handle to wire here.
       return { ok: true, url };
     } catch (e) {
-      // Surface the tunnel failure rather than silently returning ok:true with no url.
+      // Surface the tunnel failure — and release the port (see invariant above).
+      // The tunnel OPEN stays cached in tunnelCache for the next start() to reuse.
+      this.stop();
       return { ok: false, error: `tunnel unavailable: ${errMsg(e)}` };
     }
   }
 
-  /** Close the HTTP server. Idempotent and best-effort.
-   *  Note: tunnelmole has no documented close handle; teardown is best-effort. */
+  /** Close the HTTP server. Idempotent and best-effort. The tunnel client is
+   *  session-cached (tunnelCache.ts) — tunnelmole has no close API, so it stays
+   *  for reuse by the next start() rather than leaking one client per restart. */
   stop(): void {
     this.tunnelUrl = null;
     try { this.server?.close(); } catch { /* noop */ }
@@ -146,16 +149,9 @@ export class WebhookServer {
     });
   }
 
-  private async openTunnel(): Promise<string> {
+  private openTunnel(): Promise<string> {
     // TODO: optional persistent domain — pass `domain` here when config carries one.
-    // Dynamic import keeps the ESM-only `tunnelmole` out of the CJS require graph.
-    const { tunnelmole } = await import('tunnelmole');
-    return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('timed out')), TUNNEL_START_TIMEOUT_MS);
-      tunnelmole({ port: this.port })
-        .then((url) => { clearTimeout(timer); resolve(url); })
-        .catch((e) => { clearTimeout(timer); reject(e); });
-    });
+    return getTunnel(this.port, TUNNEL_START_TIMEOUT_MS);
   }
 
   /** Fixed-window limiter — bounds total work before any parse/crypto runs. */

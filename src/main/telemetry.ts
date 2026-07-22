@@ -365,6 +365,20 @@ export class TelemetryCollector {
     if (ring.length > SPAN_RING_CAP) ring.splice(0, ring.length - SPAN_RING_CAP);
   }
 
+  /** Drop everything accumulated for one agent — its span ring, session set,
+   *  and each session accumulator. Called from PTY teardown: the maps here are
+   *  otherwise add-only, so a floor that churns ephemeral workers (fresh agent
+   *  id per spawn) grows them for the app's whole run, and snapshot() — taken
+   *  every 8s by the fleet beat — keeps re-copying dead agents' spans. Cost
+   *  rows are already persisted to the durable ledger at emit time, and
+   *  getAgentUsage falls back to transcripts, so nothing durable is lost. */
+  evictAgent(agentId: string): void {
+    this.spans.delete(agentId);
+    const set = this.agentSessions.get(agentId);
+    if (set) for (const sessionId of set) this.sessions.delete(sessionId);
+    this.agentSessions.delete(agentId);
+  }
+
   /** Sum an agent's live sessions into one cumulative sample (sessionId/model =
    *  the most recently active session). Null if the agent has no live data. */
   private aggregateLive(agentId: string): AgentUsageSample | null {
