@@ -137,6 +137,12 @@ export interface ThemeConfig {
   monitor: MonitorConfig;
   palette: PaletteConfig;
   cast: ThemeCast;
+  /** Optional multiply-tint applied to the TILE layers only (never the
+   *  characters — they live in a separate container and must stay legible for
+   *  status). Lets a theme recolor a SHARED tileset toward its own tone without
+   *  new art: e.g. Brooklyn 99 cools the warm office atlas toward precinct
+   *  blue-gray. Omit (or 0xffffff) for no change. */
+  tint?: number;
 }
 
 /** The existing office, expressed as a theme. Values are copied verbatim from
@@ -220,11 +226,18 @@ export const OFFICE_THEME: ThemeConfig = {
  *  The map (brooklyn99.tmj) is a precinct bullpen: Captain Holt's glass office
  *  in the back corner (`desk-ceo`), an 8-desk detective bullpen (`pc-1..8`), a
  *  briefing room (boardroom zone) + break room (cafeteria zone) with the coffee
- *  economy. PLACEHOLDER ART: the map reuses the office tileset gids, so the
- *  tilesets / monitor / palette / cast below reuse the office theme verbatim —
- *  Pam's license-clean B99 tileset + cast likenesses (§C/§D) drop into those
- *  same seams later. Only the layout-bound anchors (seats, café, coffee, props,
- *  errands) are authored to brooklyn99.tmj's own coordinates. */
+ *  economy.
+ *
+ *  ART STATUS (honest): there is no licensed B99 tileset/cast, so the SHARED
+ *  office atlas + cast frames are reused. What makes it read as the precinct
+ *  rather than Dunder-Mifflin is done WITHOUT new art: (1) a precinct-navy
+ *  canvas + status palette (`palette` below, no longer inherited), and (2) a
+ *  cool blue-gray multiply-`tint` over the tile layers (`tint` below) that
+ *  shifts the warm office wood/beige toward NYPD tones while leaving avatars
+ *  full-color. A license-clean B99 tileset + cast likenesses can later drop
+ *  into the `tilesets`/`cast` seams and the tint can be dialed back then.
+ *  Only the layout-bound anchors (seats, café, coffee, props, errands) are
+ *  authored to brooklyn99.tmj's own coordinates. */
 export const BROOKLYN99_THEME: ThemeConfig = {
   id: 'brooklyn99',
   mapRaw: brooklyn99MapRaw,
@@ -278,10 +291,22 @@ export const BROOKLYN99_THEME: ThemeConfig = {
     { kind: 'bin', stand: { x: 19, y: 20 }, facing: 'left', fx: { x: 18, y: 20 }, duration: 2.6 },
     { kind: 'bin', stand: { x: 34, y: 15 }, facing: 'up', fx: { x: 34, y: 14 }, duration: 2.6 },
   ],
-  // PLACEHOLDER: brooklyn99.tmj paints the office desk stamp (monitor gid 365).
+  // brooklyn99.tmj paints the office desk stamp (monitor gid 365) — same atlas.
   monitor: OFFICE_THEME.monitor,
-  // PLACEHOLDER: office palette + cast until Pam's B99 art (§C/§D) lands.
-  palette: OFFICE_THEME.palette,
+  // Precinct palette: a deep NYPD navy canvas (distinct from the office's near-
+  // black ink) — the visible clear color behind the map. Status note colors are
+  // kept identical to the office on purpose: todo/doing/blocked/done encode task
+  // STATE, not decoration, so they must read the same across every theme.
+  palette: {
+    background: 0x141b2e,
+    noteColors: OFFICE_THEME.palette.noteColors,
+  },
+  // Cool blue-gray multiply-tint over the tile layers: recolors the SHARED warm
+  // office atlas toward precinct tones without any new art. Characters are in a
+  // separate container and stay full-color (status legibility). Reds attenuate
+  // more than blues here, so wood/beige shifts cool.
+  tint: 0xb4c2da,
+  // No licensed B99 cast art — reuse the office sprite frames (see ART STATUS).
   cast: OFFICE_THEME.cast,
 };
 

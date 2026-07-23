@@ -65,7 +65,10 @@ export class TiledMapRenderer {
 
   private static readonly WALKABLE_SPAWN_PREFIXES = ['desk-', 'pc-', 'warroom-', 'entrance'];
 
-  constructor(private mapData: TiledMap, private tilesetTextures: Texture[]) {
+  /** @param tileTint optional multiply-tint for TILE sprites only (theme recolor
+   *   of a shared atlas). Characters live in a separate container and are never
+   *   tinted, so status remains legible. */
+  constructor(private mapData: TiledMap, private tilesetTextures: Texture[], private tileTint?: number) {
     this.width = mapData.width;
     this.height = mapData.height;
     this.tileSize = mapData.tilewidth;
@@ -217,6 +220,10 @@ export class TiledMapRenderer {
 
             const frame = new Rectangle(srcX, srcY, tw, th);
             const sprite = new Sprite(new Texture({ source: texture.source, frame }));
+            // Per-tile multiply-tint (theme recolor of a shared atlas). Applied
+            // per-sprite rather than on the container so it is Pixi-version-proof;
+            // characterContainer is added AFTER this loop, so avatars are untinted.
+            if (this.tileTint !== undefined) sprite.tint = this.tileTint;
 
             if (flippedH || flippedV || flippedD) {
               sprite.anchor.set(0.5, 0.5);

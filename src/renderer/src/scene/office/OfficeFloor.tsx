@@ -210,7 +210,7 @@ export function OfficeFloor() {
       const world = new Container();
       app.stage.addChild(world);
 
-      const mapRenderer = new TiledMapRenderer(resolveThemeMap(theme), tilesetTextures);
+      const mapRenderer = new TiledMapRenderer(resolveThemeMap(theme), tilesetTextures, theme.tint);
       world.addChild(mapRenderer.getContainer());
       const charLayer = mapRenderer.getCharacterContainer();
       const tileCount = mapRenderer.getContainer().children.reduce(
