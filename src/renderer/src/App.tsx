@@ -78,6 +78,13 @@ export function App() {
       // Mirror the active office theme so OfficeFloor renders it (gated on the
       // tvShowOffices flag; off = always the office). Settings keeps this synced.
       useStore.getState().setOfficeTheme(c.tvShowOffices ? (c.officeTheme ?? 'office') : 'office');
+      // Mirror the terminal font config (#95) so PtyTerminalView applies it live;
+      // unset fields fall back to the historical hardcoded look inside the
+      // setters (family) / via the ?? default (size).
+      useStore.getState().setTerminalFontFamily(c.terminalFontFamily ?? '');
+      if (typeof c.terminalFontSize === 'number') {
+        useStore.getState().setTerminalFontSizeDefault(c.terminalFontSize);
+      }
     });
     // Mirror BYOK OpenAI key presence (boolean only; the key never leaves main) so the
     // Realtime Michael voice toggle can gate on it. Lives in the secret broker, not

@@ -113,7 +113,19 @@ export interface HarnessConfig {
   providerBaseUrls?: Partial<Record<AgentProvider, string>>;
   /** Per-CLI-provider default model slug, used to pre-fill the model picker. */
   providerDefaultModels?: Partial<Record<AgentProvider, string>>;
+  /** xterm font family for every pooled terminal (#95). Unset = the historical
+   *  hardcoded 'VT323, monospace'. Mirrors src/main/config.ts. */
+  terminalFontFamily?: string;
+  /** Default xterm font size (px) for terminals with no per-session zoom override
+   *  (#95). Unset = the historical hardcoded 14. Mirrors src/main/config.ts. */
+  terminalFontSize?: number;
 }
+
+/** Defaults for the terminal font config (#95) — byte-identical to the values
+ *  that were hardcoded in terminalPool.ts / PtyTerminalView.tsx before the
+ *  fields existed, so an unset config keeps today's exact look. */
+export const DEFAULT_TERMINAL_FONT_FAMILY = 'VT323, monospace';
+export const DEFAULT_TERMINAL_FONT_SIZE = 14;
 
 /** The Sonnet model with the 1M-token context window — used for Michael's prep
  *  assistant (cheap, large-context context gathering). Mirrors ASSISTANT_MODEL

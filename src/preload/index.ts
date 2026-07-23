@@ -275,6 +275,12 @@ export interface HarnessConfig {
   knowledgeGraph?: KnowledgeGraphConfig;
   /** Terminal theme, mirrored into each agent's per-session Claude settings. */
   terminalTheme?: 'light' | 'dark';
+  /** xterm font family for the renderer's pooled terminals (#95). Unset = the
+   *  historical hardcoded 'VT323, monospace'. Mirrors src/main/config.ts. */
+  terminalFontFamily?: string;
+  /** Default xterm font size (px) when no per-session zoom override exists (#95).
+   *  Unset = the historical hardcoded 14. Mirrors src/main/config.ts. */
+  terminalFontSize?: number;
   /** TV-show office themes feature flag (Settings picker + switch flow). Default OFF. */
   tvShowOffices?: boolean;
   /** Active office map/cast theme (honored only when tvShowOffices is on). */

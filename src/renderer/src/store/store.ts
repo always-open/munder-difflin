@@ -5,6 +5,7 @@ import type { ThemeId } from '@/scene/office/themeRegistry';
 import type { StatusKind } from '@/components/PixelBadge';
 import type { AgentProvider } from '@shared/agentProvider';
 import type { HireManifest } from '@shared/hire';
+import { DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_TERMINAL_FONT_SIZE } from '@/store/config';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -205,6 +206,15 @@ interface State {
    *  on switch). OfficeFloor depends on this and rebuilds the scene on change. */
   officeTheme: ThemeId;
   setOfficeTheme: (theme: ThemeId) => void;
+  /** Mirror of config.terminalFontFamily (set by App on config load + Settings on
+   *  save) so every mounted PtyTerminalView re-applies it live — same pattern as
+   *  officeTheme. Defaults to the historical hardcoded family (#95). */
+  terminalFontFamily: string;
+  setTerminalFontFamily: (family: string) => void;
+  /** Mirror of config.terminalFontSize — the DEFAULT size for terminals without a
+   *  per-session zoom override (the localStorage zoom still wins). */
+  terminalFontSizeDefault: number;
+  setTerminalFontSizeDefault: (px: number) => void;
   /** Park a message for an agent. Returns nothing; the flush loop delivers it.
    *  `meta.instruction`, when set, is what gets typed into the PTY instead of
    *  `text` (UI/card surfaces still show `text`). */
@@ -514,6 +524,18 @@ export const useStore = create<State>((set) => ({
   setHasOpenAiKey: (has) => set({ hasOpenAiKey: has }),
   officeTheme: 'office',
   setOfficeTheme: (theme) => set({ officeTheme: theme }),
+  terminalFontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
+  setTerminalFontFamily: (family) =>
+    set({ terminalFontFamily: family.trim() || DEFAULT_TERMINAL_FONT_FAMILY }),
+  terminalFontSizeDefault: DEFAULT_TERMINAL_FONT_SIZE,
+  // Clamp to the same bounds as PtyTerminalView's zoom (8–40px) so a bad config
+  // value can't render an unusable grid.
+  setTerminalFontSizeDefault: (px) =>
+    set({
+      terminalFontSizeDefault: Number.isFinite(px)
+        ? Math.min(40, Math.max(8, Math.round(px)))
+        : DEFAULT_TERMINAL_FONT_SIZE
+    }),
   enqueueMessage: (agentId, text, meta) =>
     set((s) => {
       const trimmed = text.trim();

@@ -18,6 +18,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
+import { DEFAULT_TERMINAL_FONT_FAMILY } from '@/store/config';
 
 export interface TerminalEntry {
   term: Terminal;
@@ -39,8 +40,10 @@ const pool = new Map<string, TerminalEntry>();
 type ThemeMap = Record<string, string>;
 
 /** Get (or lazily create) the persistent terminal for a pty. Theme/font are
- *  only used at creation; an attaching view re-applies its own afterwards. */
-export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14): TerminalEntry {
+ *  only used at creation; an attaching view re-applies its own afterwards.
+ *  `fontFamily` defaults to the historical hardcoded value so callers that
+ *  don't care (restart/revive paths) keep today's exact look (#95). */
+export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14, fontFamily = DEFAULT_TERMINAL_FONT_FAMILY): TerminalEntry {
   const existing = pool.get(ptyId);
   if (existing) return existing;
 
@@ -50,7 +53,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
 
   const term = new Terminal({
     theme,
-    fontFamily: 'VT323, monospace',
+    fontFamily,
     fontSize,
     lineHeight: 1.0,
     cursorBlink: true,
