@@ -130,6 +130,28 @@ export interface KnowledgeGraphConfig {
   rootPath?: string;
 }
 
+/** A named, reusable bundle of environment + spawn defaults a user manages in
+ *  Settings and picks at hire time (#105). The motivating case: separate
+ *  work/personal Claude accounts via `CLAUDE_CONFIG_DIR`, which MD had no way to
+ *  set. `env` is injected into the agent's child process (merged UNDER the
+ *  integration-broker keys at spawn — see `mergeSpawnEnv`, so a profile can never
+ *  clobber the capability token). `model`/`command`/`provider` prefill the hire
+ *  form. Stored in config.json alongside the existing secrets. */
+export interface Profile {
+  /** Stable id (used as the picker key; not surfaced to the user). */
+  id: string;
+  /** Human label shown in Settings + the hire dropdown. */
+  label: string;
+  /** Environment variables injected into the agent's process at spawn. */
+  env?: Record<string, string>;
+  /** Optional model override prefilled into the hire form. */
+  model?: string;
+  /** Optional spawn command prefilled into the hire form. */
+  command?: string;
+  /** Optional provider prefilled into the hire form. */
+  provider?: AgentProvider;
+}
+
 export interface HarnessConfig {
   /** Has the user completed the first-run onboarding? */
   onboardingComplete: boolean;
@@ -332,6 +354,12 @@ export interface HarnessConfig {
   /** Never condense a file smaller than this; also the section-trigger byte floor.
    *  DECIDED: 16 KB. */
   reflectMinBytes?: number;
+
+  // ─── Agent Profiles (#105) ─────────────────────────────────────────────────
+  /** Named agent profiles — reusable env + spawn-default bundles the user manages
+   *  in Settings and selects at hire. Default undefined/[] = feature dark (no
+   *  picker shown, no env injected). */
+  profiles?: Profile[];
 }
 
 const DEFAULTS: HarnessConfig = {
@@ -528,4 +556,36 @@ export function ensureClaudePermissionsAccepted(cwd?: string): void {
       }
     } catch { /* best-effort */ }
   }
+}
+
+// ─── Agent Profiles (#105) — pure helpers ─────────────────────────────────────
+
+/** Spawn-env merge precedence (#105). A selected profile's `env` is the BASE; the
+ *  integration-broker keys (MD_BROKER_URL / MD_BROKER_TOKEN) are layered ON TOP so
+ *  a profile can never clobber the loopback capability token — the broker always
+ *  wins. `CLAUDE_CONFIG_DIR` (the motivating value) and the broker keys are
+ *  disjoint, so the common case is a clean union. Pure + exported so the exact
+ *  precedence is unit-tested (test/profiles.test.cjs); the spawn sites apply the
+ *  identical `{ ...profileEnv, ...brokerEnv }` shape. */
+export function mergeSpawnEnv(
+  profileEnv?: Record<string, string>,
+  brokerEnv?: Record<string, string>
+): Record<string, string> {
+  return { ...(profileEnv ?? {}), ...(brokerEnv ?? {}) };
+}
+
+/** Insert-or-replace a profile by id (pure CRUD reducer used by the Settings
+ *  editor before it persists via writeConfig({ profiles })). */
+export function upsertProfile(profiles: Profile[] | undefined, profile: Profile): Profile[] {
+  const list = profiles ?? [];
+  const i = list.findIndex((p) => p.id === profile.id);
+  if (i < 0) return [...list, profile];
+  const next = list.slice();
+  next[i] = profile;
+  return next;
+}
+
+/** Remove a profile by id (pure CRUD reducer). */
+export function removeProfile(profiles: Profile[] | undefined, id: string): Profile[] {
+  return (profiles ?? []).filter((p) => p.id !== id);
 }

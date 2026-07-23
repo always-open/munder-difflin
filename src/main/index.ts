@@ -3204,7 +3204,7 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   const spawnOpts: AgentSpawnOptions = {
     id: workerId, cwd, command, cols: 120, rows: 32,
     args: raw.model ? ['--model', raw.model] : [],
-    hive: meta, isolate, provider: raw.provider, env: brokerEnv
+    hive: meta, isolate, provider: raw.provider, env: { ...((raw as SpawnRequest & { env?: Record<string, string> }).env ?? {}), ...brokerEnv }
   };
 
   let res: { ok: boolean; error?: string };

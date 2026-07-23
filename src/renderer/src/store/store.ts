@@ -72,6 +72,12 @@ export interface Agent {
   /** When git isolation is enabled, the dedicated worktree path the agent runs
    *  in (its own `agent/<id>` branch); undefined for shared-cwd agents. */
   worktreePath?: string;
+  /** Resolved environment snapshot from the profile selected at hire (#105).
+   *  Stored on the recipe (the RESOLVED env, not a profileId) so it survives a
+   *  profile edit/delete and is durable across restart — part of the persisted
+   *  spawn recipe (see updateAgent's DURABLE set + persistAgents). Injected into
+   *  the agent's child process at spawn. */
+  env?: Record<string, string>;
   /** Live context size of the agent's Claude session (tokens), polled from its
    *  transcript. Drives the context gauge on the agent card. */
   contextTokens?: number;
@@ -460,7 +466,7 @@ export const useStore = create<State>((set) => ({
       // CommandCenterPanel.restartWithModel) evaporate on app quit and the
       // restorable/auto-revive paths respawn the OLD model. Status/action churn
       // (every hook event) deliberately skips the localStorage write.
-      const DURABLE: ReadonlyArray<keyof Agent> = ['command', 'provider', 'model', 'cwd', 'worktreePath'];
+      const DURABLE: ReadonlyArray<keyof Agent> = ['command', 'provider', 'model', 'cwd', 'worktreePath', 'env'];
       if (DURABLE.some((k) => k in patch)) persistAgents(agents, s.selectedId);
       return { agents };
     }),

@@ -929,6 +929,9 @@ export function useHive(config: HarnessConfig | null): void {
           isolate: false,
           // Reattach the agent's prior session so no context is lost on revive.
           resume: true,
+          // Re-apply the agent's profile env (#105) — e.g. CLAUDE_CONFIG_DIR must
+          // survive an auto-revive or the revived child talks to the wrong account.
+          env: a.env,
           hive
         });
         if (res.ok) {

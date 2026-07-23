@@ -187,6 +187,10 @@ export interface SpawnPtyOptions {
    *  main process seeds that session's `.jsonl` into the target cwd's project dir
    *  (copying it from wherever it lives) and launches `claude --resume <id>`. */
   resumeSessionId?: string;
+  /** Extra environment for the agent's child process (#105 — Agent Profiles). The
+   *  selected profile's resolved env; merged over the shell env in pty.ts and, for
+   *  broker-granted workers, UNDER the broker keys so the capability token wins. */
+  env?: Record<string, string>;
 }
 
 export interface PtyExit { exitCode: number; signal?: number | undefined }
@@ -211,6 +215,17 @@ export interface ScheduledMission {
 export interface KnowledgeGraphConfig {
   enabled?: boolean;
   rootPath?: string;
+}
+
+/** A named agent profile (#105) — reusable env + spawn defaults selectable at
+ *  hire. Mirrors src/main/config.ts `Profile`. */
+export interface Profile {
+  id: string;
+  label: string;
+  env?: Record<string, string>;
+  model?: string;
+  command?: string;
+  provider?: AgentProvider;
 }
 
 export interface CircuitBreakerConfig {
@@ -295,6 +310,9 @@ export interface HarnessConfig {
   providerBaseUrls?: Partial<Record<AgentProvider, string>>;
   /** Per-CLI-provider default model slug, used to pre-fill the model picker. */
   providerDefaultModels?: Partial<Record<AgentProvider, string>>;
+  /** Named agent profiles (#105) — reusable env + spawn-default bundles selectable
+   *  at hire. Mirrors src/main/config.ts. */
+  profiles?: Profile[];
 }
 
 export interface MemoryStatus {

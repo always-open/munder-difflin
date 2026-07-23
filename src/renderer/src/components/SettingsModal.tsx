@@ -9,6 +9,7 @@ import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { OfficeThemePicker } from './OfficeThemePicker';
+import { ProfilesEditor } from './ProfilesEditor';
 import { McpDefaultsSettings } from './McpDefaultsSettings';
 import { IntegrationsRegistry } from './IntegrationsRegistry';
 import { AiEnginesSettings } from './AiEnginesSettings';
@@ -890,6 +891,11 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
 
                       {/* Office Theme — TV-show office maps (experimental; flag tvShowOffices, default off) */}
                       <OfficeThemePicker config={config} />
+
+                      <div style={{ height: 1, background: 'var(--cth-ink-300)' }} />
+
+                      {/* Agent Profiles (#105) — reusable env + spawn-default bundles selectable at hire */}
+                      <ProfilesEditor config={config} />
                     </>
                   )}
 

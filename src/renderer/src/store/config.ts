@@ -45,6 +45,17 @@ export interface KnowledgeGraphConfig {
   rootPath?: string;
 }
 
+/** A named agent profile (#105) — reusable env + spawn defaults selectable at
+ *  hire. Mirrors src/main/config.ts `Profile`. */
+export interface Profile {
+  id: string;
+  label: string;
+  env?: Record<string, string>;
+  model?: string;
+  command?: string;
+  provider?: AgentProvider;
+}
+
 export interface HarnessConfig {
   onboardingComplete: boolean;
   /** Self-identified audience from the first onboarding screen ('technical' vs
@@ -119,6 +130,26 @@ export interface HarnessConfig {
   /** Default xterm font size (px) for terminals with no per-session zoom override
    *  (#95). Unset = the historical hardcoded 14. Mirrors src/main/config.ts. */
   terminalFontSize?: number;
+  /** Named agent profiles (#105) — reusable env + spawn-default bundles selectable
+   *  at hire. Mirrors src/main/config.ts. */
+  profiles?: Profile[];
+}
+
+/** Insert-or-replace a profile by id (pure CRUD reducer — mirrors src/main/config.ts).
+ *  The ProfilesEditor computes the next list with this, then persists it via
+ *  window.cth.updateConfig({ profiles }). */
+export function upsertProfile(profiles: Profile[] | undefined, profile: Profile): Profile[] {
+  const list = profiles ?? [];
+  const i = list.findIndex((p) => p.id === profile.id);
+  if (i < 0) return [...list, profile];
+  const next = list.slice();
+  next[i] = profile;
+  return next;
+}
+
+/** Remove a profile by id (pure CRUD reducer — mirrors src/main/config.ts). */
+export function removeProfile(profiles: Profile[] | undefined, id: string): Profile[] {
+  return (profiles ?? []).filter((p) => p.id !== id);
 }
 
 /** Defaults for the terminal font config (#95) — byte-identical to the values

@@ -87,6 +87,9 @@ export function AgentStrip({ config }: AgentStripProps) {
           // new one (re-isolating would conflict on the existing path/branch and
           // lose its uncommitted work).
           isolate: false,
+          // Re-apply the agent's profile env (#105) so a restored agent keeps its
+          // CLAUDE_CONFIG_DIR / custom env instead of reverting to the default.
+          env: a.env,
           // Continue the worker's prior CLI session if one was recorded — the
           // main process picks the provider's resume flag (Claude --resume,
           // agy --conversation) and for Claude reattaches the transcript. The

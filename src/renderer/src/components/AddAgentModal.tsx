@@ -177,6 +177,27 @@ export function AddAgentModal({ onClose, config, onConfigChange }: AddAgentModal
   );
   const [description, setDescription] = useState(pendingHire?.description ?? 'a fresh harness');
   const [hireMeta, setHireMeta] = useState<HireManifest | null>(pendingHire);
+  // Agent Profiles (#105) — the picked profile's resolved env, carried through to
+  // the spawn IPC and persisted on the agent recipe. `selectedProfileId` only
+  // drives the picker's active state (a deleted/edited profile can't break a
+  // spawned agent because we store the resolved env snapshot, not the id).
+  const profiles = config.profiles ?? [];
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [profileEnv, setProfileEnv] = useState<Record<string, string> | undefined>(undefined);
+  /** Select (or clear, with null) a profile: prefill provider/model/command and
+   *  attach its env to the spawn. Command precedence: an explicit profile command
+   *  wins; else the command is rebuilt from the profile's model + provider so it
+   *  stays coherent with the picked engine. */
+  const applyProfile = (id: string | null) => {
+    const p = id ? profiles.find((x) => x.id === id) ?? null : null;
+    setSelectedProfileId(p ? p.id : null);
+    setProfileEnv(p?.env && Object.keys(p.env).length ? p.env : undefined);
+    if (!p) return;
+    const nextProvider = p.provider ?? (p.command ? inferAgentProvider(p.command) : provider);
+    setProvider(nextProvider);
+    if (p.model !== undefined) setModel(p.model);
+    setCommand(p.command ? p.command : buildSpawnCommand(config, p.model ?? model, nextProvider));
+  };
 
   // Picking a model rebuilds the command; the command field stays editable for
   // power users (it's the source of truth for the actual spawn).
@@ -318,6 +339,9 @@ export function AddAgentModal({ onClose, config, onConfigChange }: AddAgentModal
       isolate: resuming ? false : isolate,
       // #2 — continue an existing Claude session in this agent's cwd.
       resumeSessionId: resuming ? resumeSessionId.trim() : undefined,
+      // #105 — the selected profile's env, injected into the agent's process
+      // (merged over the shell env in pty.ts). Undefined when no profile is picked.
+      env: profileEnv,
       // Provision this agent in the hive (memory + mailbox + identity/protocol).
       hive: {
         id,
@@ -361,6 +385,9 @@ export function AddAgentModal({ onClose, config, onConfigChange }: AddAgentModal
       // Persist the resolved worktree path (set only when isolation provisioned
       // one) so a restart can re-enter this exact worktree — see restoreTeam.
       worktreePath: spawnRes.worktreePath,
+      // #105 — persist the resolved profile env on the recipe (durable field, see
+      // store.updateAgent's DURABLE set) so Restore/auto-revive can re-apply it.
+      env: profileEnv,
       // Crush (seedDelivery:'type-into-tui') hands its hive protocol back here
       // instead of on argv; useHive types it into the TUI after boot. (ondev-b)
       seedPrompt: spawnRes.seedPrompt,
@@ -723,6 +750,50 @@ export function AddAgentModal({ onClose, config, onConfigChange }: AddAgentModal
 
                 {section === 'engine' && (
                   <>
+                    {profiles.length > 0 && (
+                      <Row label="Profile">
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                          <button
+                            onClick={() => applyProfile(null)}
+                            title="No profile — no extra environment"
+                            style={{
+                              padding: '3px 8px 1px',
+                              background: selectedProfileId === null ? `var(--cth-${accent}-light)` : 'var(--cth-cream-100)',
+                              boxShadow: selectedProfileId === null
+                                ? 'inset 0 0 0 2px var(--cth-ink-900)'
+                                : 'inset 0 0 0 1px var(--cth-ink-700)',
+                              fontFamily: 'var(--cth-font-ui)', fontSize: 13,
+                              color: 'var(--cth-ink-900)', cursor: 'pointer', border: 'none'
+                            }}
+                          >
+                            none
+                          </button>
+                          {profiles.map((p) => {
+                            const active = selectedProfileId === p.id;
+                            const envCount = Object.keys(p.env ?? {}).length;
+                            return (
+                              <button
+                                key={p.id}
+                                onClick={() => applyProfile(p.id)}
+                                title={envCount ? `${envCount} env var${envCount === 1 ? '' : 's'}` : 'spawn defaults only'}
+                                style={{
+                                  padding: '3px 8px 1px',
+                                  background: active ? `var(--cth-${accent}-light)` : 'var(--cth-cream-100)',
+                                  boxShadow: active
+                                    ? 'inset 0 0 0 2px var(--cth-ink-900)'
+                                    : 'inset 0 0 0 1px var(--cth-ink-700)',
+                                  fontFamily: 'var(--cth-font-ui)', fontSize: 13,
+                                  color: 'var(--cth-ink-900)', cursor: 'pointer', border: 'none'
+                                }}
+                              >
+                                {p.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </Row>
+                    )}
+
                     <Row label="Provider">
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                         {AGENT_PROVIDER_PRESETS.map((p) => {
